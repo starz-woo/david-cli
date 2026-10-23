@@ -59,6 +59,9 @@ class TerminalProcess:
         # A worker event may render before the async submit clears its draft.
         # Clear that draft explicitly so this command cannot append to /save on.
         self.send('\x15/quit\r')
+        self.expect_exit()
+
+    def expect_exit(self):
         deadline = time.monotonic() + 5
         while self.process.poll() is None and time.monotonic() < deadline:
             self.read()
@@ -74,6 +77,92 @@ class TerminalProcess:
 
 @unittest.skipIf(sys.platform == 'win32', 'POSIX PTY; Windows IME/console must be checked natively')
 class TuiWorkflowTests(unittest.TestCase):
+    def check_idle_exit(self, key):
+        with tempfile.TemporaryDirectory() as tmp, fixture_server([]) as (url, requests):
+            root = Path(tmp).resolve()
+            config = root / 'config.json'
+            config.write_text(json.dumps({'model': {'base_url': url, 'name': 'exit-fixture'}}))
+            for draft in ('', 'unfinished draft'):
+                with self.subTest(draft=draft):
+                    terminal = TerminalProcess(config, root, root)
+                    try:
+                        terminal.expect('❯')
+                        terminal.send(draft + key)
+                        terminal.expect_exit()
+                        self.assertEqual(terminal.process.returncode, 0)
+                    finally:
+                        terminal.close()
+            self.assertEqual(requests, [], 'exiting must not submit the draft')
+
+    def test_real_tui_idle_ctrl_c_exits_process(self):
+        self.check_idle_exit('\x03')
+
+    def test_real_tui_idle_ctrl_d_exits_process(self):
+        self.check_idle_exit('\x04')
+
+    def test_real_tui_exit_during_approval_never_writes(self):
+        for key in ('\x04', '\x11', '/quit\r', '/exit\r', '\x03\x03'):
+            with self.subTest(key=repr(key)), tempfile.TemporaryDirectory() as tmp, fixture_server([
+                tool_message('write_file', {'path': 'must-not-exist.txt', 'content': 'unsafe'}, 'write')
+            ]) as (url, requests):
+                root = Path(tmp).resolve()
+                config = root / 'config.json'
+                config.write_text(json.dumps({'model': {'base_url': url, 'name': 'exit-fixture', 'stream': False}}))
+                terminal = TerminalProcess(config, root, root)
+                try:
+                    terminal.expect('❯')
+                    terminal.send('create a file\r')
+                    terminal.expect('Approval')
+                    terminal.send(key + '\x19')
+                    terminal.expect_exit()
+                finally:
+                    terminal.close()
+                self.assertFalse((root / 'must-not-exist.txt').exists())
+                self.assertEqual(len(requests), 1)
+
+    def test_real_tui_stalled_http_ctrl_c_cancels_then_exits(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+        entered, release = threading.Event(), threading.Event()
+
+        class StalledHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                entered.set()
+                release.wait()
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), StalledHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                config = root / 'config.json'
+                config.write_text(json.dumps({'model': {
+                    'base_url': f'http://127.0.0.1:{server.server_port}/v1',
+                    'name': 'stalled-fixture', 'stream': False, 'timeout_seconds': 60}}))
+                terminal = TerminalProcess(config, root, root)
+                try:
+                    terminal.expect('❯')
+                    terminal.send('request that stalls\r')
+                    self.assertTrue(entered.wait(4), 'request must reach the real HTTP server')
+                    terminal.send('\x03')
+                    terminal.expect('cancelled')
+                    self.assertIsNone(terminal.process.poll(), 'first Ctrl+C cancels without exiting')
+                    terminal.send('\x03')
+                    terminal.expect_exit()
+                    self.assertFalse(release.is_set(), 'exit must not depend on server responding')
+                finally:
+                    terminal.close()
+        finally:
+            release.set()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
     def test_real_tui_patch_test_save_resume_and_conflict_safe_undo(self):
         original = 'value = 1\n'
         digest = hashlib.sha256(original.encode()).hexdigest()

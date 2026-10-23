@@ -368,6 +368,7 @@ class DavidTUI:
         def cancel(event):
             self.cancel()
 
+        @bindings.add('c-d')
         @bindings.add('c-q')
         def quit(event):
             self.request_close()
@@ -461,9 +462,17 @@ class DavidTUI:
 
     def footer_text(self):
         storage = 'saving ON (평문)' if self.saving else '저장 OFF'
+        # Keep an exit route visible even when the rest is clipped on narrow terminals.
+        exit_hint = 'Ctrl+D exit'
         if not self.follow_output:
-            return '  Paused · ' + ('new output · ' if self.unseen_output else '') + 'Ctrl+End latest · ' + storage
-        return '  /help · Ctrl+C stop · ' + storage
+            return exit_hint + ' · Paused · ' + ('new output · ' if self.unseen_output else '') + 'Ctrl+End latest · ' + storage
+        if self._cancel_requested:
+            cancel_hint = 'Ctrl+C again to exit'
+        elif self.controller.busy or self._submitting or self.approval is not None:
+            cancel_hint = 'Ctrl+C stop'
+        else:
+            cancel_hint = 'Ctrl+C exit'
+        return exit_hint + ' · ' + cancel_hint + ' · /help · ' + storage
 
     def changes_text(self):
         if not self.changes:
@@ -492,14 +501,16 @@ class DavidTUI:
         self.application.invalidate()
 
     def cancel(self):
-        if self.controller.busy or self._submitting or self.approval is not None:
+        if self._cancel_requested:
+            self.request_close()
+        elif self.controller.busy or self._submitting or self.approval is not None:
             self._cancel_requested = True
             self.approval = None
             self.status = 'stopping'
-            self.detail = 'Cancellation requested; waiting for active work'
+            self.detail = 'Cancellation requested; Ctrl+C again or Ctrl+D to exit safely'
             self.controller.cancel()
         else:
-            self.composer.text = ''
+            self.request_close()
 
     def request_close(self):
         if self._closing:
@@ -524,26 +535,26 @@ class DavidTUI:
                     self.application.exit(result=0)
                     return
                 self.status = 'stopping'
-                self.detail = 'Still stopping; waiting safely (Ctrl+Q requested shutdown)'
+                self.detail = 'Still stopping; waiting safely for active work to finish'
                 self.application.invalidate()
                 await asyncio.sleep(.2)
         except Exception as exc:
             self.status = 'error'
-            self.detail = safe_text(exc) + '; Ctrl+Q retries shutdown'
+            self.detail = safe_text(exc) + '; Ctrl+D or Ctrl+Q retries shutdown'
         finally:
             self._closing = False
             self.application.invalidate()
 
     def submit(self):
         text = safe_text(self.composer.text)
+        if text in ('/quit', '/exit'):
+            self.request_close()
+            return
         if self.approval is not None:
             if text in ('yes', 'no'):
                 self._decide(text == 'yes')
             else:
                 self.detail = 'Type exactly yes or no, or use Ctrl+Y / Ctrl+N'
-            return
-        if text in ('/quit', '/exit'):
-            self.request_close()
             return
         if not self._stopping and not self._submitting and text.strip():
             self.return_to_latest()
