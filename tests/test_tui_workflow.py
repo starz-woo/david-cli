@@ -120,6 +120,36 @@ class TuiWorkflowTests(unittest.TestCase):
                 self.assertFalse((root / 'must-not-exist.txt').exists())
                 self.assertEqual(len(requests), 1)
 
+    def test_real_tui_approval_menu_requires_navigation_before_enter(self):
+        for keys, allowed in (('\x1b[A\r', True), ('\x1b[B\r', False), ('\x1b', False)):
+            with self.subTest(keys=repr(keys)), tempfile.TemporaryDirectory() as tmp, fixture_server([
+                tool_message('write_file', {'path': 'decision.txt', 'content': 'approved'}, 'write'),
+                {'role': 'assistant', 'content': 'MENU_WORKFLOW_DONE'},
+            ]) as (url, requests):
+                root = Path(tmp).resolve()
+                config = root / 'config.json'
+                config.write_text(json.dumps({'model': {'base_url': url, 'name': 'menu-fixture', 'stream': False}}))
+                terminal = TerminalProcess(config, root, root)
+                try:
+                    terminal.expect('❯')
+                    terminal.send('write file\r')
+                    terminal.expect('Allow once')
+                    terminal.send('\r')
+                    deadline = time.monotonic() + .3
+                    while time.monotonic() < deadline:
+                        terminal.read(.03)
+                    self.assertEqual(len(requests), 1, 'unscoped Enter must not resolve approval')
+                    self.assertFalse((root / 'decision.txt').exists())
+                    terminal.send(keys)
+                    terminal.expect('MENU_WORKFLOW_DONE')
+                    terminal.expect('done')
+                    terminal.send('\x04')
+                    terminal.expect_exit()
+                finally:
+                    terminal.close()
+                self.assertEqual((root / 'decision.txt').exists(), allowed)
+                self.assertEqual(len(requests), 2)
+
     def test_real_tui_stalled_http_ctrl_c_cancels_then_exits(self):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         import threading

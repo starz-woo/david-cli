@@ -1,8 +1,9 @@
 """Small sequential agent loop; permissions live outside the model."""
 from dataclasses import dataclass
+import inspect
 import json
 import time
-from .context import context_usage
+from .context import UsageLedger, context_usage
 
 SYSTEM_PROMPT = '''You are David, a coding assistant working in one explicitly selected workspace.
 Use the user's language. Read relevant code before editing. Use the supplied tools only.
@@ -66,12 +67,28 @@ class Agent:
         self.cancel_check = cancel_check or (lambda: None)
         self.system = SYSTEM_PROMPT + ('\nUser customization:\n' + extra_prompt if extra_prompt else '')
         self.history = []
+        self.reset_usage()
         self.json_mode = settings['agent']['tool_mode'] == 'json'
         if self.json_mode:
             self.system += '\nReturn ONLY one JSON object, no markdown fences. Either '
             self.system += '{"type":"tool","name":"tool_name","arguments":{...}} OR '
             self.system += '{"type":"final","content":"answer"}. Tool schemas:\n'
             self.system += json.dumps(self.tools.schemas(), ensure_ascii=False)
+
+    def reset_usage(self):
+        self.session_usage = UsageLedger()
+        self.reset_turn_usage()
+
+    def reset_turn_usage(self):
+        """Start a turn's accounting without discarding live session spending."""
+        self.turn_usage = UsageLedger()
+        self.request_usage = None
+
+    def usage_snapshot(self):
+        messages = [{"role": "system", "content": self.system}] + [m for t in self.history for m in t]
+        return {"turn": self.turn_usage.snapshot(), "session": self.session_usage.snapshot(),
+                "request_usage": dict(self.request_usage) if self.request_usage is not None else None,
+                "context": context_usage(self.settings, messages, None if self.json_mode else self.tools.schemas())}
 
     def _messages(self, turn):
         retained = list(self.history)
@@ -128,6 +145,7 @@ class Agent:
         if not isinstance(prompt, str) or not prompt.strip():
             raise AgentError('Prompt must not be empty.')
         started = time.monotonic()
+        self.reset_turn_usage()
         turn = [{'role': 'user', 'content': prompt}]
         for step in range(self.settings['agent']['max_steps']):
             self.cancel_check()
@@ -146,8 +164,34 @@ class Agent:
                 self.cancel_check()
                 chunks.append(text)
                 self.on_text(text)
-            response = self.client.complete(messages, tools=None if self.json_mode else self.tools.schemas(),
-                                            on_text=None if self.json_mode else stream)
+            self.request_usage = None
+            def progress(item):
+                self.cancel_check()
+                self.request_usage = item.get('usage')
+                phase = item['phase']
+                labels = {'connecting': '서버 연결 중', 'waiting': '모델 응답 대기',
+                          'thinking': '추론 수신', 'generating': '응답 생성 중'}
+                self.on_event({'type': 'status', 'status': phase, 'context': dict(usage),
+                               'progress': dict(item),
+                               'detail': f"{labels[phase]} · 요청 {step + 1} · {item['elapsed_seconds']:.1f}초 "
+                                         f"· reasoning chunks {item['reasoning_chunks']} (토큰 아님)"})
+            options = {'tools': None if self.json_mode else self.tools.schemas(),
+                       'on_text': None if self.json_mode else stream}
+            # Detect support before calling: never retry TypeError, since a
+            # client may already have sent a request or performed side effects.
+            try:
+                params = inspect.signature(self.client.complete).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if 'on_progress' in params and params['on_progress'].kind != inspect.Parameter.POSITIONAL_ONLY:
+                options['on_progress'] = progress
+            complete = False
+            try:
+                response = self.client.complete(messages, **options)
+                complete = True
+            finally:
+                self.turn_usage.record(self.request_usage, complete=complete)
+                self.session_usage.record(self.request_usage, complete=complete)
             self.cancel_check()
             if not isinstance(response, dict) or response.get('role') != 'assistant':
                 raise AgentError('Invalid assistant response.')

@@ -1,12 +1,14 @@
 """Full-screen terminal frontend. The controller owns all model/tool work."""
 import asyncio
 import json
+import re
 
 from bisect import bisect_right
 from functools import lru_cache
 from copy import deepcopy
 from queue import Empty, SimpleQueue
 from threading import Lock
+from time import monotonic
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.completion import Completer, Completion, CompleteEvent
@@ -27,6 +29,7 @@ from prompt_toolkit.formatted_text import fragment_list_to_text, to_formatted_te
 from prompt_toolkit.widgets import Frame, TextArea
 
 from .cli import safe_text
+from .clipboard import ClipboardError, copy_text
 from .file_refs import file_reference_prefix, quote_file_reference
 
 
@@ -44,7 +47,7 @@ THEMES = {
         'body.system': '#999991', 'body.tool': '#a9a9a1',
         'heading': '#eeeeea bold', 'code': '#c5c5bd', 'fence': '#999991',
         'diff.add': '#a6c58b', 'diff.remove': '#dc9490', 'diff.header': '#deded8 bold',
-        'approval': '#d99572 bold',
+        'diff.context': '#b7b7ae', 'approval': '#d99572 bold', 'error': '#ff8b85 bold',
     },
     'light': {
         '': 'bg:#faf9f5 #343430', 'header': '#74746b',
@@ -56,7 +59,7 @@ THEMES = {
         'body.system': '#74746b', 'body.tool': '#67675d',
         'heading': '#242420 bold', 'code': '#505047', 'fence': '#74746b',
         'diff.add': '#3e6c2e', 'diff.remove': '#a23932', 'diff.header': '#343430 bold',
-        'approval': '#a95432 bold',
+        'diff.context': '#626259', 'approval': '#a95432 bold', 'error': '#b42318 bold',
     },
     'mono': {
         'header': '', 'title': 'bold', 'working': 'bold', 'changes': '', 'hint': '',
@@ -64,20 +67,48 @@ THEMES = {
         'body.user': 'reverse', 'role.assistant': '', 'role.system': 'italic', 'role.tool': 'bold',
         'body.system': '', 'body.tool': '', 'heading': 'bold', 'code': 'italic',
         'fence': '', 'diff.add': 'underline', 'diff.remove': 'italic',
-        'diff.header': 'bold', 'approval': 'bold underline',
+        'diff.header': 'bold', 'approval': 'bold underline', 'error': 'bold underline',
     },
 }
 
 
+def diff_rows(lines):
+    """Styles and real old/new positions, bounded by each unified hunk."""
+    old = new = old_left = new_left = 0
+    result = []
+    for text in lines:
+        left = right = ''
+        match = re.match(r'^@@ -(\d{1,9})(?:,(\d{1,9}))? \+(\d{1,9})(?:,(\d{1,9}))? @@', text)
+        if match:
+            old, count_old, new, count_new = match.groups()
+            old, new = int(old), int(new)
+            old_left, new_left = int(count_old or 1), int(count_new or 1)
+            style = 'class:diff.header'
+        elif text.startswith('-') and old_left:
+            style, left = 'class:diff.remove', str(old)
+            old, old_left = old + 1, old_left - 1
+        elif text.startswith('+') and new_left:
+            style, right = 'class:diff.add', str(new)
+            new, new_left = new + 1, new_left - 1
+        elif text.startswith(' ') and old_left and new_left:
+            style, left, right = 'class:diff.context', str(old), str(new)
+            old, new = old + 1, new + 1
+            old_left, new_left = old_left - 1, new_left - 1
+        else:
+            if not text.startswith('\\'):
+                old_left = new_left = 0
+            style = ('class:diff.header' if text.startswith(('+++', '---', '@@', 'diff --git ', 'index ')) else
+                     'class:diff.add' if text.startswith('+') else
+                     'class:diff.remove' if text.startswith('-') else 'class:diff.context')
+        result.append((style, left, right))
+    return result
+
+
 class DiffLexer(Lexer):
     def lex_document(self, document):
-        def line(number):
-            text = document.lines[number]
-            style = ('class:diff.header' if text.startswith(('+++', '---', '@@')) else
-                     'class:diff.add' if text.startswith('+') else
-                     'class:diff.remove' if text.startswith('-') else '')
-            return [(style, text)]
-        return line
+        rows = diff_rows(document.lines)
+        return lambda number: [(rows[number][0], document.lines[number])]
+
 
 
 class TranscriptLexer(Lexer):
@@ -205,6 +236,22 @@ class TranscriptWindow(Window):
             position = min((row, min(self.vertical_scroll_2, self._line_height(row) - 1)), bottom)
         self.vertical_scroll, self.vertical_scroll_2 = position
 
+    def _copy_body(self, ui_content, new_screen, write_position, move_x, width, *args, **kwargs):
+        mapping, positions = super()._copy_body(
+            ui_content, new_screen, write_position, move_x, width, *args, **kwargs)
+        # Lexers style glyphs only. Paint the entire physical row, including
+        # empty lines, wide-character filler cells and soft-wrap remainders.
+        for y, (line, _) in mapping.items():
+            if not 0 <= y < write_position.height:
+                continue
+            prefixes = self.owner._line_prefixes
+            if line < len(prefixes) and prefixes[line][0] == 'class:role.user':
+                row = new_screen.data_buffer[write_position.ypos + y]
+                for x in range(write_position.xpos + move_x, write_position.xpos + move_x + width):
+                    cell = row[x]
+                    row[x] = Char(cell.char, 'class:body.user ' + cell.style)
+        return mapping, positions
+
     def scroll_rows(self, amount):
         if self._content is None:
             return
@@ -246,7 +293,7 @@ class WorkspaceCompleter(Completer):
                 if path.startswith(prefix):
                     yield Completion(quote_file_reference(path), start_position=-length, display=path)
         elif before.startswith('/') and not any(c.isspace() for c in before):
-            for command in self.controller.commands:
+            for command in dict.fromkeys([*self.controller.commands, '/copy', '/select']):
                 if command.startswith(before) and safe_text(command) == command:
                     yield Completion(command, start_position=-len(before))
 
@@ -279,17 +326,31 @@ class DavidTUI:
         self.follow_output = True
         self.unseen_output = False
         self.approval = None
+        self.approval_choice = False
+        self.approval_menu = Window(FormattedTextControl(self.approval_menu_text, focusable=True), height=1)
+        self._diff_numbers = []
         self.approval_panel = TextArea(read_only=True, scrollbar=True, wrap_lines=True, lexer=DiffLexer(),
+                                       get_line_prefix=self._diff_prefix,
                                        height=Dimension(min=1, preferred=7, max=12))
         self.status = 'idle'
+        self._phase_started = monotonic()
+        self.context_usage = {}
+        self.server_usage = {}
         self.detail = ''
         self._closing = False
         self._stopping = False
         self._submitting = False
         self._composer_revision = 0
+        self.input_history = []
+        self._history_index = None
+        self._history_draft = Document('')
+        self._last_reply = None
+        self._copying = False
         self._cancel_requested = False
         self.session_id = controller.session_id
         self.saving = controller.saving
+        self.selecting = False
+        self.selection_panel = TextArea(read_only=True, wrap_lines=True, scrollbar=True)
         self.transcript = TextArea(read_only=True, wrap_lines=True)
         self.transcript.window = TranscriptWindow(
             self, content=self.transcript.control, wrap_lines=True,
@@ -308,6 +369,17 @@ class DavidTUI:
         @bindings.add('c-s', filter=editing)
         def submit(event):
             self.submit()
+
+        history = editing & Condition(lambda: self.approval is None and
+                                      self.composer.buffer.complete_state is None)
+
+        @bindings.add('up', filter=history & Condition(lambda: self._composer_boundary(-1)))
+        def history_previous(event):
+            self._recall_history(-1)
+
+        @bindings.add('down', filter=history & Condition(lambda: self._composer_boundary(1)))
+        def history_next(event):
+            self._recall_history(1)
 
         @bindings.add('escape', 'enter', filter=editing)
         @bindings.add('c-j', filter=editing)
@@ -344,27 +416,57 @@ class DavidTUI:
             self.show_tool_details = not self.show_tool_details
             self._render_transcript()
 
+        @bindings.add('escape', filter=Condition(lambda: self.selecting), eager=True)
+        def leave_selection(event):
+            self.selecting = False
+            self.application.layout.focus(self.composer)
+
+        @bindings.add('/', filter=has_focus(self.selection_panel))
+        def selection_command(event):
+            self.selecting = False
+            self.application.layout.focus(self.composer)
+            self.composer.buffer.insert_text('/')
+
+        @bindings.add('c-b', filter=has_focus(self.selection_panel))
+        def copy_selection(event):
+            if not self._copying:
+                buffer = self.selection_panel.buffer
+                if buffer.selection_state:
+                    text = buffer.copy_selection().text
+                    if text:
+                        self._copying = True
+                        self.application.create_background_task(self._copy(text))
+                else:
+                    self.detail = 'Ctrl+Space starts a selection; arrows extend it; Ctrl+B copies'
+
         @bindings.add('pageup')
         def page_up(event):
-            if self.application.layout.has_focus(self.approval_panel):
+            if self.selecting and self.application.layout.has_focus(self.selection_panel):
                 scroll_page_up(event)
+            elif self.approval is not None:
+                self._scroll_approval(event, scroll_page_up)
             else:
                 window = self.transcript.window
                 window.scroll_rows(-max(1, window._height - 1))
 
         @bindings.add('pagedown')
         def page_down(event):
-            if self.application.layout.has_focus(self.approval_panel):
+            if self.selecting and self.application.layout.has_focus(self.selection_panel):
                 scroll_page_down(event)
+            elif self.approval is not None:
+                self._scroll_approval(event, scroll_page_down)
             else:
                 window = self.transcript.window
                 window.scroll_rows(max(1, window._height - 1))
 
         @bindings.add('c-end')
         def latest(event):
-            self.return_to_latest()
+            if self.selecting:
+                self.selection_panel.buffer.cursor_position = len(self.selection_panel.text)
+            else:
+                self.return_to_latest()
 
-        @bindings.add('c-c')
+        @bindings.add('c-c', eager=True)
         def cancel(event):
             self.cancel()
 
@@ -372,6 +474,36 @@ class DavidTUI:
         @bindings.add('c-q')
         def quit(event):
             self.request_close()
+
+        menu_focus = has_focus(self.approval_menu)
+        menu_navigation = Condition(lambda: self.approval is not None) & (
+            menu_focus | (editing & Condition(lambda: not self.composer.text)))
+
+        @bindings.add('up', filter=menu_navigation)
+        @bindings.add('left', filter=menu_navigation)
+        def choose_allow(event):
+            self.approval_choice = True
+            self.application.layout.focus(self.approval_menu)
+
+        @bindings.add('down', filter=menu_navigation)
+        @bindings.add('right', filter=menu_navigation)
+        def choose_deny(event):
+            self.approval_choice = False
+            self.application.layout.focus(self.approval_menu)
+
+        @bindings.add('enter', filter=menu_focus)
+        def decide_selected(event):
+            self._decide(self.approval_choice)
+
+        @bindings.add(Keys.Any, filter=menu_focus)
+        def menu_typing(event):
+            # Slash exits remain available even after navigating the menu.
+            self.application.layout.focus(self.composer)
+            self.composer.buffer.insert_text(safe_text(event.data))
+
+        @bindings.add('escape', filter=Condition(lambda: self.approval is not None), eager=True)
+        def escape_deny(event):
+            self._decide(False)
 
         @bindings.add('c-y', filter=Condition(lambda: self.approval is not None))
         def approve(event):
@@ -381,11 +513,13 @@ class DavidTUI:
         def deny(event):
             self._decide(False)
 
+        transcript_view = DynamicContainer(lambda: self.selection_panel if self.selecting else self.transcript)
         normal = HSplit([
                 Window(FormattedTextControl(self.banner_text), height=3),
-                self.transcript,
+                transcript_view,
                 ConditionalContainer(
-                    Frame(self.approval_panel, title='Approval · yes / no · Ctrl+Y / Ctrl+N',
+                    Frame(HSplit([self.approval_panel, self.approval_menu]),
+                          title='Approval · ↑↓ Enter · Esc deny · Ctrl+Y / Ctrl+N',
                           style='class:approval'),
                     filter=Condition(lambda: self.approval is not None)),
                 ConditionalContainer(
@@ -395,6 +529,8 @@ class DavidTUI:
                     Window(FormattedTextControl(self.activity_text), wrap_lines=True,
                            height=Dimension(min=1, max=3), dont_extend_height=True),
                     Condition(lambda: self.status != 'idle' or bool(self.detail))),
+                Window(FormattedTextControl(self.usage_text), wrap_lines=True,
+                       height=Dimension(min=1, max=4), dont_extend_height=True),
                 Window(height=1, char='─', style='class:frame.border'),
                 self.composer,
                 Window(height=1, char='─', style='class:frame.border'),
@@ -404,13 +540,19 @@ class DavidTUI:
             ConditionalContainer(Window(FormattedTextControl(self.header_text), height=1,
                                         style='class:header'),
                                  Condition(lambda: self._size().rows >= 6)),
-            ConditionalContainer(self.transcript,
+            ConditionalContainer(transcript_view,
                                  Condition(lambda: self._size().rows >= 4 and self.approval is None)),
             ConditionalContainer(self.approval_panel, Condition(lambda: self.approval is not None
                                                                 and self._size().rows >= 3)),
+            ConditionalContainer(self.approval_menu, Condition(lambda: self.approval is not None
+                                                               and self._size().rows >= 4)),
             ConditionalContainer(Window(FormattedTextControl(self.activity_text), height=1),
                                  Condition(lambda: self._size().rows >= 6 and
                                            (self.status != 'idle' or bool(self.detail)))),
+            ConditionalContainer(
+                Window(FormattedTextControl(self.usage_text), wrap_lines=True,
+                       height=Dimension(min=1, max=3), dont_extend_height=True),
+                Condition(lambda: self._size().rows >= 8)),
             self.composer,
             ConditionalContainer(Window(FormattedTextControl(self.footer_text), height=1),
                                  Condition(lambda: self._size().rows >= 2)),
@@ -424,6 +566,7 @@ class DavidTUI:
             key_bindings=bindings, full_screen=True, mouse_support=True,
             input=input, output=output, before_render=self._drain_events,
             style=Style.from_dict(THEMES[self.theme]),
+            refresh_interval=.1,
         )
         controller.on_event = self.handle_event
         self.handle_event({'type': 'message', 'role': 'system', 'text':
@@ -456,14 +599,51 @@ class DavidTUI:
     def activity_text(self):
         # Only real controller state, never invented thinking time/token counts.
         active = self.status not in ('idle', 'done', 'cancelled', 'error', 'approval')
+        if self.status == 'error':
+            return [('class:error', '  ERROR'), ('class:error', ' · ' + safe_text(self.detail))]
+        elapsed = max(0, monotonic() - self._phase_started)
+        # The clock animates the emitted phase; it never infers reasoning.
+        animated = self.status in ('connecting', 'waiting', 'thinking', 'generating', 'tool',
+                                   'reading', 'editing', 'running')
         prefix = '✳ ' if active else '  '
-        return [('class:working' if active else 'class:hint', prefix + self.status),
+        timer = f' · {elapsed:.1f}s ' + '✳✶✻✽'[int(elapsed * 8) % 4] if animated else ''
+        return [('class:working' if active else 'class:hint', prefix + self.status + timer),
                 ('class:hint', safe_text(' · ' + self.detail) if self.detail else '')]
+
+    def usage_text(self):
+        # Server accounting spans requests; context occupancy is a separate measure.
+        turn = self.server_usage.get('turn', {}).get('tokens', {})
+        session = self.server_usage.get('session', {}).get('tokens', {})
+        def count(tokens, key):
+            value = tokens.get(key)
+            return '?' if value is None else str(value)
+        question = f"Q in:{count(turn, 'prompt_tokens')} out:{count(turn, 'completion_tokens')}"
+        cumulative = (f"S total:{count(session, 'total_tokens')}" if session.get('total_tokens') is not None
+                      else f"S in:{count(session, 'prompt_tokens')} out:{count(session, 'completion_tokens')}")
+        if self.server_usage.get('turn', {}).get('partial'):
+            question += ' partial'
+        if self.server_usage.get('session', {}).get('partial'):
+            cumulative += ' partial'
+        text = question + ' · ' + cumulative + ' · tokens(server/live) · /usage'
+        context = self.context_usage
+        occupancy = ''
+        if context.get('unit') == 'estimated_tokens':
+            occupancy = (f"\ncontext ESTIMATE {context.get('estimated_input_tokens', '?')}/"
+                         f"{context.get('input_budget_tokens', '?')} tokens"
+                         f" · output reserve {context.get('reserved_output_tokens', '?')}")
+        elif context.get('unit') == 'characters':
+            occupancy = (f"\ncontext {context.get('input_characters', '?')}/"
+                         f"{context.get('input_budget_characters', '?')} chars (not tokens)")
+        if context.get('method'):
+            occupancy += '\nmethod: ' + ' '.join(safe_text(context['method']).split())
+        return [('class:hint', safe_text(text + occupancy))]
 
     def footer_text(self):
         storage = 'saving ON (평문)' if self.saving else '저장 OFF'
         # Keep an exit route visible even when the rest is clipped on narrow terminals.
         exit_hint = 'Ctrl+D exit'
+        if self.selecting:
+            return exit_hint + ' · Ctrl+Space mark · arrows select · Ctrl+B copy · Esc back'
         if not self.follow_output:
             return exit_hint + ' · Paused · ' + ('new output · ' if self.unseen_output else '') + 'Ctrl+End latest · ' + storage
         if self._cancel_requested:
@@ -473,6 +653,31 @@ class DavidTUI:
         else:
             cancel_hint = 'Ctrl+C exit'
         return exit_hint + ' · ' + cancel_hint + ' · /help · ' + storage
+
+    def _scroll_approval(self, event, scroll):
+        focused = self.application.layout.current_control
+        self.application.layout.focus(self.approval_panel)
+        try:
+            scroll(event)
+        finally:
+            self.application.layout.focus(focused)
+
+    def _diff_prefix(self, line, wrap):
+        if self._size().columns < 48 or line >= len(self._diff_numbers):
+            return []
+        text = self._diff_numbers[line]
+        return [('class:hint', ' ' * len(text) if wrap else text)]
+
+    def _number_diff(self, text):
+        self._diff_numbers = [f'{left:>4} {right:>4} │ '
+                              for _, left, right in diff_rows(text.split('\n'))]
+
+    def approval_menu_text(self):
+        return [('class:approval' + (' reverse' if self.approval_choice else ''),
+                 ('❯ ' if self.approval_choice else '  ') + 'Allow once'),
+                ('', '    '),
+                ('class:approval' + (' reverse' if not self.approval_choice else ''),
+                 ('❯ ' if not self.approval_choice else '  ') + 'Deny')]
 
     def changes_text(self):
         if not self.changes:
@@ -506,6 +711,7 @@ class DavidTUI:
         elif self.controller.busy or self._submitting or self.approval is not None:
             self._cancel_requested = True
             self.approval = None
+            self.application.layout.focus(self.composer)
             self.status = 'stopping'
             self.detail = 'Cancellation requested; Ctrl+C again or Ctrl+D to exit safely'
             self.controller.cancel()
@@ -550,11 +756,26 @@ class DavidTUI:
         if text in ('/quit', '/exit'):
             self.request_close()
             return
+        if text == '/select':
+            self.composer.text = ''
+            if self.approval is not None:
+                self.detail = 'Finish the approval before opening selection view'
+            elif self._last_reply is None:
+                self.detail = 'No finalized assistant reply available to select'
+            else:
+                self.selecting = True
+                self.selection_panel.buffer.set_document(Document(self._last_reply, 0), bypass_readonly=True)
+                self.application.layout.focus(self.selection_panel)
+            return
+        if text == '/copy':
+            self.composer.text = ''
+            self.copy_reply()
+            return
         if self.approval is not None:
             if text in ('yes', 'no'):
                 self._decide(text == 'yes')
             else:
-                self.detail = 'Type exactly yes or no, or use Ctrl+Y / Ctrl+N'
+                self.detail = '↑↓ to select Allow once / Deny, Enter to confirm; Esc denies. Or type yes / no.'
             return
         if not self._stopping and not self._submitting and text.strip():
             self.return_to_latest()
@@ -565,6 +786,11 @@ class DavidTUI:
     async def _submit(self, text, revision):
         try:
             accepted = await asyncio.to_thread(self.controller.submit, text)
+            if accepted and not text.lstrip().startswith('/') and len(text) <= 100000:
+                self.input_history.append(text)
+                while len(self.input_history) > 100 or sum(map(len, self.input_history)) > 100000:
+                    self.input_history.pop(0)
+                self._history_index = None
             if accepted and self._cancel_requested:
                 self.controller.cancel()
             if accepted and revision == self._composer_revision and self.approval is None:
@@ -575,6 +801,61 @@ class DavidTUI:
         finally:
             self._submitting = False
             self.application.invalidate()
+
+    def copy_reply(self):
+        if self._copying:
+            return
+        if self._last_reply is None:
+            self.detail = 'No finalized assistant reply available to copy'
+            return
+        self._copying = True
+        self.application.create_background_task(self._copy(self._last_reply))
+
+    async def _copy(self, text):
+        try:
+            await asyncio.to_thread(copy_text, text)
+            self.detail = 'Copied plain text to the native clipboard'
+        except ClipboardError as exc:
+            self.detail = ('Copy failed: ' + safe_text(exc) +
+                           '. Terminal Shift+mouse selection may work (terminal-dependent).')
+        finally:
+            self._copying = False
+            self.application.invalidate()
+
+    def _composer_boundary(self, direction):
+        # Match physical wrapping, including a two-cell prompt and wide glyphs.
+        # Do not consume Up/Down as history in the middle of a visual document.
+        document = self.composer.buffer.document
+        width = max(3, self._size().columns)
+        starts, column = [0], 2
+        for index, character in enumerate(document.text + ' '):
+            if character == '\n':
+                starts.append(index + 1)
+                column = 2
+                continue
+            cells = TranscriptWindow._cell_width(character)
+            if column + cells > width:
+                starts.append(index)
+                column = 2
+            column += cells
+        visual_row = bisect_right(starts, document.cursor_position) - 1
+        return visual_row == (0 if direction < 0 else len(starts) - 1)
+
+    def _recall_history(self, direction):
+        if not self.input_history:
+            return
+        if self._history_index is None:
+            if direction > 0:
+                return
+            self._history_draft = self.composer.buffer.document
+            self._history_index = len(self.input_history)
+        self._history_index = max(0, min(len(self.input_history), self._history_index + direction))
+        if self._history_index == len(self.input_history):
+            self.composer.buffer.document = self._history_draft
+            self._history_index = None
+        else:
+            text = self.input_history[self._history_index]
+            self.composer.buffer.document = Document(text, 0 if direction < 0 else len(text))
 
     def _decide(self, decision):
         with self._event_lock:
@@ -622,6 +903,12 @@ class DavidTUI:
                 self.follow_output = True
                 self.unseen_output = False
                 self._entries.clear()
+                self._last_reply = None
+                self.selecting = False
+                self.selection_panel.buffer.set_document(Document(''), bypass_readonly=True)
+                self.context_usage = {}
+                self.server_usage = {}
+                self._history_index = None
                 self._trimmed = False
                 self.changes = []
                 self._stream_index = None
@@ -640,6 +927,14 @@ class DavidTUI:
             elif kind == 'message':
                 role = safe_text(event.get('role', 'message'))
                 text = safe_text(event.get('text', ''))
+                if role == 'user':
+                    # The controller emits this before each accepted prompt/retry.
+                    # Do not let the previous question masquerade as the new one.
+                    self.server_usage = {'session': self.server_usage.get('session', {})}
+                    self.context_usage = {}
+                if role == 'assistant':
+                    # Keep a bounded full reply, never silently copy a truncated one.
+                    self._last_reply = text if len(text) <= 1000000 else None
                 if role == 'assistant' and self._stream_index is not None:
                     self._entries[self._stream_index]['text'] = text
                     self._entries[self._stream_index]['_text_offset'] = 0
@@ -656,7 +951,7 @@ class DavidTUI:
                     else f'{key}: {value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)}'
                     for key, value in result.items())
                 self._entries.append({'role': 'tool ' + name, 'text': outcome,
-                                      'details': safe_text(details)})
+                                      'details': safe_text(details), 'error': bool(failed)})
                 self._stream_index = None
             elif kind == 'changes':
                 self.changes = event.get('changes', [])
@@ -665,18 +960,32 @@ class DavidTUI:
                 # Some controllers deliver the final assistant message after metrics.
                 # Keep its streaming slot until that message or the next turn arrives.
             elif kind == 'approval' and not self._stopping and not self._cancel_requested:
+                self.selecting = False
                 self.approval = event
+                self.approval_choice = False
                 self._shown_approval_epoch = event['_approval_epoch']
                 self.status = 'approval'
                 self.detail = 'Review the action before deciding'
                 text = safe_text(str(event.get('action', '')) + '\n' + str(event.get('detail', '')))
+                self._number_diff(text)
                 self.approval_panel.buffer.set_document(Document(text, 0), bypass_readonly=True)
                 self.composer.text = ''
                 self.application.layout.focus(self.composer)
             elif kind == 'status' and not self._stopping:
-                self.status = safe_text(event.get('status', 'idle'))
+                status = safe_text(event.get('status', 'idle'))
+                if status != self.status:
+                    self._phase_started = monotonic()
+                self.status = status
+                if isinstance(event.get('usage'), dict):
+                    self.server_usage = event['usage']
+                    if isinstance(self.server_usage.get('context'), dict):
+                        self.context_usage = self.server_usage['context']
+                if isinstance(event.get('context'), dict):
+                    self.context_usage = event['context']
                 self.detail = safe_text(event.get('detail', ''))
                 if self.status in ('cancelled', 'error', 'done', 'idle'):
+                    if self.approval is not None:
+                        self.application.layout.focus(self.composer)
                     self.approval = None
             elif kind == 'session':
                 self.session_id = safe_text(event.get('id', ''))
@@ -729,6 +1038,7 @@ class DavidTUI:
             if len(detail) > budget:
                 detail = '[상태 상세: 화면 기록 한도로 뒷부분 생략]\n' + detail[:budget]
             self._status_entry['text'] = detail
+            self._status_entry['error'] = self.status == 'error'
             entries = [*entries, self._status_entry]
         for entry in entries:
             if lines:
@@ -737,14 +1047,15 @@ class DavidTUI:
             role = entry['role']
             category = role if role in ('user', 'assistant') else 'tool' if role.startswith('tool ') else 'system'
             if category == 'tool':
-                add(role[5:], 'class:role.tool', ('class:role.tool', '● '))
+                tool_style = 'class:error' if entry.get('error') else 'class:role.tool'
+                add(('ERROR ' if entry.get('error') else '') + role[5:], tool_style, (tool_style, '● '))
             entry_starts.append((entry, start, entry.get('_text_offset', 0), len(lines)))
             text = entry['text']
             if 'details' in entry:
                 text += ('\n' + entry['details']) if self.show_tool_details else ' [Ctrl+O details]'
             in_code = False
             for number, body_line in enumerate(text.split('\n')):
-                style = 'class:body.' + category
+                style = 'class:error' if entry.get('error') else 'class:body.' + category
                 if category == 'assistant':
                     if body_line.lstrip().startswith(('```', '~~~')):
                         style = 'class:fence'
