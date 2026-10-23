@@ -65,6 +65,73 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
         self.pipe.send_text(text)
         await asyncio.sleep(.06)
 
+    async def test_idle_ctrl_c_exits_even_with_a_draft(self):
+        await self.send('unfinished draft\x03')
+        self.assertTrue(self.task.done(), 'idle Ctrl+C must exit, not only clear the draft')
+        self.assertEqual(self.task.result(), 0)
+        self.assertTrue(self.controller.closed)
+        self.assertFalse(self.controller.submissions)
+
+    async def check_ctrl_d_exit(self, focus):
+        self.controller.busy = True
+        self.controller.close = lambda timeout=0: False
+        self.controller.on_event({'type': 'approval', 'action': 'write', 'detail': 'do not write'})
+        await self.wait_for(lambda: self.ui.approval is not None)
+        self.ui.application.layout.focus(getattr(self.ui, focus))
+        self.ui.composer.text = 'unfinished draft'
+        await self.send('\x04\x19')
+        self.assertTrue(self.ui._stopping, 'Ctrl+D must override buffer delete/EOF in every focus')
+        self.assertIsNone(self.ui.approval)
+        self.assertFalse(self.controller.decisions)
+        self.assertFalse(self.task.done(), 'must wait for controller cleanup')
+        self.assertFalse(self.controller.submissions)
+        self.controller.close = lambda timeout=0: True
+        self.assertEqual(await asyncio.wait_for(self.task, 3), 0)
+
+    async def test_ctrl_d_safely_exits_with_draft_from_composer(self):
+        await self.check_ctrl_d_exit('composer')
+
+    async def test_ctrl_d_safely_exits_with_draft_from_transcript(self):
+        await self.check_ctrl_d_exit('transcript')
+
+    async def test_ctrl_d_safely_exits_with_draft_from_approval(self):
+        await self.check_ctrl_d_exit('approval_panel')
+
+    async def test_exit_hint_is_visible_in_compact_and_paused_layouts(self):
+        from prompt_toolkit.data_structures import Size
+        for rows, columns in ((24, 100), (8, 24), (3, 12)):
+            for follow in (True, False):
+                with self.subTest(rows=rows, columns=columns, follow=follow):
+                    self.ui.follow_output = follow
+                    self.ui.application.output.get_size = lambda: Size(rows, columns)
+                    self.ui.application._on_resize()
+                    await asyncio.sleep(.03)
+                    screen = self.ui.application.renderer.last_rendered_screen
+                    rendered = '\n'.join(''.join(cell.char for _, cell in sorted(line.items()))
+                                         for y, line in sorted(screen.data_buffer.items())
+                                         if 0 <= y < rows)
+                    self.assertIn('Ctrl+D exit', rendered)
+
+    async def test_cancel_hint_explains_next_exit_and_resets_on_new_submission(self):
+        self.assertIn('Ctrl+C exit', self.ui.footer_text())
+        self.controller.busy = True
+        self.assertIn('Ctrl+C stop', self.ui.footer_text())
+        await self.send('\x03')
+        self.assertFalse(self.task.done())
+        self.assertIn('Ctrl+C again', self.ui.detail)
+        self.assertIn('Ctrl+D', self.ui.detail)
+        self.assertIn('Ctrl+C again', self.ui.footer_text())
+        self.controller.busy = False
+        self.controller.on_event({'type': 'status', 'status': 'cancelled'})
+        await self.wait_for(lambda: self.ui.status == 'cancelled')
+        self.assertIn('Ctrl+C again', self.ui.footer_text())
+        await self.send('new request\r')
+        await self.wait_for(lambda: self.controller.submissions)
+        self.controller.busy = True
+        await self.send('\x03')
+        self.assertFalse(self.task.done(), 'new work must receive its own first cancellation')
+        self.assertEqual(self.controller.cancelled, 2)
+
     async def test_startup_discloses_server_transmission_and_storage_off(self):
         await self.wait_for(lambda: '서버로 전송' in self.ui.transcript.text)
         self.assertIn('샌드박스', self.ui.transcript.text)
@@ -135,11 +202,8 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
         await self.send('\x19')
         self.assertEqual(self.controller.decisions, [True, False, True])
 
-    async def test_cancel_and_quit_wait_for_cooperative_close_without_freezing(self):
+    async def test_cancel_and_next_ctrl_c_wait_for_cooperative_close_without_freezing(self):
         import threading
-        await self.send('draft\x03')
-        self.assertEqual(self.ui.composer.text, '')
-        self.assertEqual(self.controller.cancelled, 0)
         self.controller.busy = True
         self.controller.on_event({'type': 'approval', 'action': 'run', 'detail': 'sleep'})
         await self.wait_for(lambda: self.ui.approval is not None)
@@ -156,15 +220,17 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             return False
         self.controller.close = close
         try:
-            await self.send('\x11')
-            await self.wait_for(entered.is_set)
+            await self.send('\x03')
+            self.assertTrue(entered.is_set(), 'second Ctrl+C must request cooperative shutdown')
+            self.assertTrue(self.ui._stopping)
             await self.send('responsive')
             self.assertEqual(self.ui.composer.text, 'responsive')
             self.assertFalse(self.task.done())
             self.assertNotEqual(threads[0], threading.get_ident())
         finally:
             release.set()
-        await self.wait_for(lambda: 'Ctrl+Q' in self.ui.detail)
+        await self.wait_for(lambda: 'Still stopping' in self.ui.detail)
+        self.assertNotIn('Ctrl+Q requested', self.ui.detail)
         self.assertIn('stopping', self.ui.status_text())
         self.assertFalse(self.task.done())
         self.assertEqual(self.controller.closed, [0])
@@ -340,6 +406,37 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.ui.status, 'cancelled')
         self.assertFalse(self.task.done())
 
+    async def check_exit_command_during_approval(self, command):
+        self.controller.on_event({'type': 'approval', 'action': 'write', 'detail': 'must not run'})
+        await self.wait_for(lambda: self.ui.approval is not None)
+        await self.send(command + '\r\x19')
+        self.assertTrue(self.task.done(), 'exit commands must take precedence over approval input')
+        self.assertEqual(self.task.result(), 0)
+        self.assertTrue(self.controller.closed)
+        self.assertFalse(self.controller.decisions)
+        self.assertFalse(self.controller.submissions)
+
+    async def test_quit_command_exits_during_approval(self):
+        await self.check_exit_command_during_approval('/quit')
+
+    async def test_exit_command_exits_during_approval(self):
+        await self.check_exit_command_during_approval('/exit')
+
+    async def test_failed_shutdown_offers_ctrl_d_retry_without_resuming_work(self):
+        def fail(timeout=0):
+            raise RuntimeError('cleanup failed')
+        self.controller.close = fail
+        await self.send('\x04')
+        await self.wait_for(lambda: self.ui.status == 'error')
+        self.assertIn('Ctrl+D', self.ui.detail)
+        self.assertIn('retries shutdown', self.ui.detail)
+        self.assertFalse(self.task.done())
+        await self.send('do not start\r')
+        self.assertFalse(self.controller.submissions)
+        self.controller.close = lambda timeout=0: True
+        await self.send('\x04')
+        self.assertEqual(await asyncio.wait_for(self.task, 3), 0)
+
     async def test_quit_command_uses_cooperative_shutdown(self):
         await self.send('/quit\r')
         await self.wait_for(self.task.done)
@@ -347,7 +444,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.controller.closed)
         self.assertFalse(self.controller.submissions)
 
-    async def test_quit_waits_for_pending_submit_before_final_close(self):
+    async def check_exit_waits_for_pending_submit(self, keys):
         import threading
         entered, release = threading.Event(), threading.Event()
         def submit(text):
@@ -364,12 +461,22 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
         try:
             await self.send('start\r')
             await self.wait_for(entered.is_set)
-            await self.send('\x11')
+            await self.send(keys)
+            self.assertTrue(self.ui._stopping)
             self.assertFalse(self.task.done())
         finally:
             release.set()
         self.assertEqual(await asyncio.wait_for(self.task, 3), 0)
         self.assertFalse(self.controller.busy)
+
+    async def test_quit_waits_for_pending_submit_before_final_close(self):
+        await self.check_exit_waits_for_pending_submit('\x11')
+
+    async def test_ctrl_d_waits_for_pending_submit_before_final_close(self):
+        await self.check_exit_waits_for_pending_submit('\x04')
+
+    async def test_second_ctrl_c_waits_for_pending_submit_before_final_close(self):
+        await self.check_exit_waits_for_pending_submit('\x03\x03')
 
     async def test_final_message_after_summary_does_not_duplicate_stream(self):
         for event in [
