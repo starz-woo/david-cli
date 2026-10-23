@@ -4,17 +4,24 @@ import json
 from pathlib import Path
 
 DEFAULTS = {
+    'model_profiles': {},
     'mcp': {'servers': {}},
     'skills': {'registered': {}, 'enabled': []},
     'ui': {'theme': 'dark', 'input_height': 5},
     'model': {
         'base_url': 'http://127.0.0.1:11434/v1', 'name': 'CHANGE_ME',
-        'api_key_env': '', 'timeout_seconds': 90, 'max_tokens': 2048,
+        'api_key_env': '', 'timeout_seconds': 90, 'max_tokens': 32000,
+        # Zero inherits the total budget; total=0 preserves timeout_seconds.
+        'connect_timeout_seconds': 0, 'idle_timeout_seconds': 0, 'total_timeout_seconds': 0,
+        # Opt in only if the configured server accepts stream_options.
+        'stream_include_usage': False,
         'temperature': 0.2, 'stream': True, 'allow_insecure_http': False,
         'ca_file': '', 'max_response_bytes': 2097152,
         # Explicit client budget, not endpoint discovery or a model capability claim.
         # Zero preserves legacy agent.max_context_chars; positive replaces it.
-        'context_window_tokens': 0, 'max_request_bytes': 2097152,
+        'context_window_tokens': 131072, 'max_request_bytes': 2097152,
+        'profile': '', 'context_safety_margin_tokens': 1024,
+        'tokenizer_file': '', 'tokenizer_config_file': '', 'chat_template_file': '',
     },
     'agent': {
         'tool_mode': 'native', 'max_steps': 12, 'max_context_chars': 60000,
@@ -53,6 +60,36 @@ def _number(value, low, high, field, integer=False):
         raise ConfigError(f'{field}: expected a number in [{low}, {high}].')
 
 
+PROFILE_NUMBERS = {'context_window_tokens': (0, 2000000), 'max_tokens': (1, 131072),
+                   'context_safety_margin_tokens': (0, 2000000)}
+TOKENIZER_PATHS = ('tokenizer_file', 'tokenizer_config_file', 'chat_template_file')
+
+
+def _model_profile(raw):
+    """Explicit selection only: model names do not imply server capabilities."""
+    import re
+    profiles = raw.get('model_profiles', {})
+    if not isinstance(profiles, dict) or len(profiles) > 32:
+        raise ConfigError('model_profiles must map at most 32 names to profile objects.')
+    for name, profile in profiles.items():
+        if not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', name):
+            raise ConfigError('Model profile names must be short identifiers.')
+        if not isinstance(profile, dict) or set(profile) - (set(PROFILE_NUMBERS) | set(TOKENIZER_PATHS)):
+            raise ConfigError('Unknown model profile setting.')
+        for key, value in profile.items():
+            if key in PROFILE_NUMBERS:
+                _number(value, *PROFILE_NUMBERS[key], 'model profile.' + key, integer=True)
+            elif not isinstance(value, str) or len(value) > 4096 or any(ord(c) < 32 for c in value):
+                raise ConfigError('Model profile tokenizer paths must be bounded strings.')
+    model = raw.get('model', {})
+    if not isinstance(model, dict):
+        raise ConfigError('model must be an object.')
+    selected = model.get('profile', '')
+    if not isinstance(selected, str) or (selected and selected not in profiles):
+        raise ConfigError('model.profile must select a registered model_profiles entry.')
+    return profiles[selected] if selected else {}
+
+
 def load_settings(path: Path) -> dict:
     try:
         if Path(path).stat().st_size > 131072:
@@ -63,15 +100,22 @@ def load_settings(path: Path) -> dict:
     if not isinstance(raw, dict) or set(raw) - set(DEFAULTS):
         raise ConfigError('Unknown settings section or invalid root object.')
     result = deepcopy(DEFAULTS)
+    profile = _model_profile(raw)
+    result['model'].update(profile)
     for section, values in raw.items():
         if not isinstance(values, dict):
             raise ConfigError(f'{section} must be an object.')
-        if section == 'commands':
+        if section in ('commands', 'model_profiles'):
             result[section] = values
         else:
             if set(values) - set(DEFAULTS[section]):
                 raise ConfigError(f'Unknown setting in {section}.')
             result[section].update(values)
+    # Legacy agent margin remains supported; selected profiles and explicit
+    # model keys take priority. Runtime uses the resolved agent margin.
+    if 'context_safety_margin_tokens' not in raw.get('model', {}) and 'context_safety_margin_tokens' not in profile:
+        result['model']['context_safety_margin_tokens'] = result['agent']['context_safety_margin_tokens']
+    result['agent']['context_safety_margin_tokens'] = result['model']['context_safety_margin_tokens']
     for section in ('model', 'agent', 'security', 'ui'):
         for key, default in DEFAULTS[section].items():
             value = result[section][key]
@@ -90,6 +134,9 @@ def load_settings(path: Path) -> dict:
     for section, key, low, high, integer in (
         ('ui', 'input_height', 3, 15, True),
         ('model', 'timeout_seconds', 1, 600, False), ('model', 'max_tokens', 1, 131072, True),
+        ('model', 'connect_timeout_seconds', 0, 600, False),
+        ('model', 'idle_timeout_seconds', 0, 600, False),
+        ('model', 'total_timeout_seconds', 0, 3600, False),
         ('model', 'context_window_tokens', 0, 2000000, True),
         ('model', 'max_request_bytes', 1024, 67108864, True),
         ('agent', 'context_safety_margin_tokens', 0, 2000000, True),
@@ -115,6 +162,16 @@ def load_settings(path: Path) -> dict:
             raise ConfigError('Command argv must be a nonempty list of nonempty strings.')
         _number(recipe.get('timeout_seconds', 60), 1, 600, 'command timeout_seconds')
     _validate_extensions(result)
+    # All paths are explicit and settings-relative, never workspace-discovered.
+    for model in (result['model'], *result['model_profiles'].values()):
+        for key in TOKENIZER_PATHS:
+            value = model.get(key, '')
+            if not isinstance(value, str) or len(value) > 4096:
+                raise ConfigError('Local tokenizer paths must be bounded strings.')
+            if value:
+                model[key] = str((Path(path).absolute().parent / Path(value).expanduser()).absolute())
+    from .tokenizer import get_counter
+    get_counter(result['model'])  # Validate opt-in configuration/dependencies offline, fail closed.
     return result
 
 

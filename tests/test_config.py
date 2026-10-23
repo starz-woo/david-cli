@@ -41,6 +41,8 @@ class ConfigTests(unittest.TestCase):
                     with self.assertRaises(ConfigError):
                         load_settings(p)
             p.write_text('{}')
+            self.assertGreater(load_settings(p)['model']['context_window_tokens'], 0)
+            p.write_text(json.dumps({'model': {'context_window_tokens': 0}}))
             self.assertEqual(load_settings(p)['model']['context_window_tokens'], 0)
 
     def test_ui_theme_and_input_height_are_customizable_and_validated(self):

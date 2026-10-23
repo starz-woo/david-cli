@@ -1,5 +1,20 @@
 # Verification — David CLI
 
+## 사용성·관측·모델 예산 통합 개선
+
+부모가 최종 전체 wrapper를 실행해 **373개 통과, 실패/skip 0**을 확인했습니다. 아래의 이전 319/304/268개 기록은 각 이전 변경의 검증입니다.
+
+- 실제 렌더: 공백/CJK/자동 줄바꿈을 포함한 전체 사용자 행 배경, 빨간 오류 라벨, 입력 이력·초안 복원, 선택 복사, 질문/세션 사용량과 현재 문맥의 분리, 작은 창의 입력창 유지.
+- 승인: 기본 Deny, 새 방향키 선택 후 Enter, Esc 거절, stale approval 방어, 실제 POSIX PTY에서 승인/거절에 따른 파일 생성 여부 검사.
+- 클립보드: 고정 native helper + UTF-8 stdin, shell=False, timeout, 명시적 사용자 동작만 허용. OS clipboard 실행은 mock 검사이며 실제 Windows clipboard 검증이 아닙니다.
+- 실 루프백 HTTP/SSE/TLS: reasoning 신호와 원시 내용 비노출, usage snapshot 중복 방지·unknown·부분 실패, connect/idle/total 시간 제한과 cancellation. 내부 TypeError로 재시도하지 않는 회귀.
+- 이전 질문 성공 뒤 첨부 누락/크기 초과/잘림 실패 시 이번 질문 사용량을 초기화하고 세션 합계를 보존하는 Controller+HTTP 회귀.
+- 프로필 우선순위, 불가능한 출력 예약 거부, 명시적 legacy 값 보존, 1M budget, 토큰 모드 첨부 문자 상한 제거, local tokenizer/template 경로 보호·fingerprint·bounded sandbox 검사.
+- 새 wheel의 18개 Python 파일과 소스 바이트 일치. 별도 환경에서 선택 의존성 없이 기본 설치/help/config check, 이어 tokenizer extra 설치 후 **합성 tokenizer로 100,014 local tokens**와 1M profile 계산 검증. 실제 모델 tokenization/capacity 검증이 아닙니다.
+- 설치본 TUI 렌더, `git diff --check`. UI·관측/usage·프로필/tokenizer 범위는 독립 리뷰를 거쳤습니다.
+
+제약: 실제 사내 서버 usage/thinking 필드 지원, tokenizer/template 일치, 1M 처리, Windows 콘솔·IME·클립보드·물리 마우스는 미검증입니다. local template subset은 제한적이며 많은 production template을 거부합니다. 사용량은 live-only이고 저장/복원되지 않습니다. 이전 수치나 추정을 실측으로 꾸미지 않습니다.
+
 ## 종료 단축키 후속 수정
 
 전체 **319개 테스트 통과**(macOS, 실패/skip 0). 실제 POSIX PTY에서 대기 중 Ctrl+C/Ctrl+D(입력 유무), 승인 중 모든 종료 경로의 쓰기 방지, 응답이 멈춘 HTTP 요청의 첫 Ctrl+C 취소·두 번째 종료를 검사했습니다. 서버가 응답을 재개하기 전에 종료됨을 확인했습니다. 입력 제출 중 취소 재전달, cleanup 완료 대기, 실패 시 재시도도 검사합니다. 작은 화면/과거 대화 탐색 중에도 `Ctrl+D exit`가 표시됩니다. Windows 콘솔의 키 전달은 미검증입니다.

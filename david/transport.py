@@ -196,9 +196,19 @@ class OpenAIClient:
     must be complete JSON objects, IDs unique, and stream indices contiguous.
     Streaming requires both a successful finish_reason and a framed [DONE].
     on_text previews may precede an error; tools are returned only on success.
-    timeout_seconds bounds network activity, including trickling headers/body
-    and waiting for DNS. A timed-out OS resolver can finish in a daemon thread
-    but cannot connect or issue HTTP requests. Callbacks must not block.
+    Optional on_progress snapshots contain observed phase, elapsed/last model
+    activity offsets, chunk/character counts (NOT tokens), and server usage.
+    Raw reasoning is neither displayed nor retained. last_usage is the latest
+    validated server snapshot, or None; callers must label failed requests partial.
+    stream_include_usage explicitly opts into requesting streaming usage; missing
+    fields remain unknown and no usage is inferred from text/chunk lengths.
+
+    timeout_seconds remains the legacy total; positive total_timeout_seconds
+    overrides it. Optional connect/idle limits inherit total when zero. Idle
+    resets on complete headers/SSE lines or JSON body bytes, never total.
+    These bounds cover trickling headers/body and DNS. A timed-out OS resolver
+    can finish in a daemon thread but cannot connect or issue HTTP requests.
+    Callbacks must not block. Instances are not safe for concurrent calls.
     """
     def __init__(self, model_config: dict, *, cancel_event=None):
         if not isinstance(model_config, dict):
@@ -230,7 +240,8 @@ class OpenAIClient:
         if type(self.max_request_bytes) is not int or not 1024 <= self.max_request_bytes <= 64 * 1024 * 1024:
             raise ModelError("Invalid model.max_request_bytes: expected 1024..67108864 bytes.")
 
-        for name, default in (("stream", True), ("allow_insecure_http", False)):
+        for name, default in (("stream", True), ("allow_insecure_http", False),
+                              ("stream_include_usage", False)):
             if type(self.config.get(name, default)) is not bool:
                 raise ModelError("Invalid model configuration.")
         for name, default in (("max_tokens", 2048), ("max_response_bytes", 2 * 1024 * 1024)):
@@ -243,6 +254,11 @@ class OpenAIClient:
                 raise ModelError("Invalid model numeric configuration.")
             if (name == "timeout_seconds" and value <= 0) or (name == "temperature" and not 0 <= value <= 2):
                 raise ModelError("Invalid model numeric configuration.")
+        for field, maximum in (("connect_timeout_seconds", 600), ("idle_timeout_seconds", 600),
+                               ("total_timeout_seconds", 3600)):
+            value = self.config.get(field, 0)
+            if type(value) not in (int, float) or not 0 <= value <= maximum or not math.isfinite(value):
+                raise ModelError("Invalid model deadline configuration.")
         name = self.config.get("name")
         key_env = self.config.get("api_key_env", "")
         ca_file = self.config.get("ca_file", "")
@@ -253,25 +269,72 @@ class OpenAIClient:
         if not isinstance(ca_file, str) or "\x00" in ca_file:
             raise ModelError("Invalid model CA file configuration.")
 
+    def _record_usage(self, obj, progress):
+        raw = obj.get("usage")
+        if raw is None:
+            return
+        if not isinstance(raw, dict):
+            _invalid()
+        usage = {key: raw.get(key) for key in
+                 ("prompt_tokens", "completion_tokens", "total_tokens")}
+        for group, field in (("prompt_tokens_details", "cached_tokens"),
+                             ("completion_tokens_details", "reasoning_tokens")):
+            details = raw.get(group)
+            if details is not None and not isinstance(details, dict):
+                _invalid()
+            usage[field] = details.get(field) if details is not None else None
+        for value in usage.values():
+            if value is not None and (type(value) is not int or not 0 <= value <= 10**12):
+                _invalid()
+        for child, parent in (("reasoning_tokens", "completion_tokens"),
+                              ("cached_tokens", "prompt_tokens"),
+                              ("prompt_tokens", "total_tokens"),
+                              ("completion_tokens", "total_tokens")):
+            part, whole = usage[child], usage[parent]
+            if part is not None and whole is not None and part > whole:
+                _invalid()
+        self.last_usage = usage
+        progress(self.last_progress["phase"], activity=True)
+
     def complete(self, messages: list, tools: list | None = None,
-                 on_text: Callable[[str], None] | None = None) -> dict:
+                 on_text: Callable[[str], None] | None = None, *,
+                 on_progress: Callable[[dict], None] | None = None) -> dict:
+        self.last_usage = None
         check_cancel(self.cancel_event)
         start = time.monotonic()
         self.last_metrics = {"elapsed_seconds": 0.0, "first_text_seconds": None}
+        self.last_progress = {"phase": "connecting", "elapsed_seconds": 0.0,
+                              "last_activity_seconds": None, "reasoning_chunks": 0,
+                              "content_characters": 0, "tool_chunks": 0}
+
+        def progress(phase, *, activity=False, reasoning=False, content=0, tool=False):
+            check_cancel(self.cancel_event)
+            elapsed = time.monotonic() - start
+            self.last_progress.update(phase=phase, elapsed_seconds=elapsed)
+            if activity:
+                self.last_progress["last_activity_seconds"] = elapsed
+            self.last_progress["reasoning_chunks"] += int(reasoning)
+            self.last_progress["content_characters"] += content
+            self.last_progress["tool_chunks"] += int(tool)
+            if on_progress is not None:
+                on_progress({**self.last_progress, "usage": dict(self.last_usage) if self.last_usage is not None else None})
 
         def emit(text):
             if self.last_metrics["first_text_seconds"] is None:
                 self.last_metrics["first_text_seconds"] = time.monotonic() - start
+            progress("generating", activity=True, content=len(text))
             if on_text is not None:
                 on_text(text)
 
         try:
-            return self._complete(messages, tools, emit, start + self.config.get("timeout_seconds", 60))
+            total_timeout = self.config.get("total_timeout_seconds", 0) or self.config.get("timeout_seconds", 60)
+            return self._complete(messages, tools, emit, start + total_timeout, progress)
         except Exception:
             check_cancel(self.cancel_event)
             raise
         finally:
             self.last_metrics["elapsed_seconds"] = time.monotonic() - start
+            self.last_progress["elapsed_seconds"] = self.last_metrics["elapsed_seconds"]
 
     def validate_request(self, messages, tools=None):
         """Preflight the exact wire payload without sending a request."""
@@ -288,6 +351,8 @@ class OpenAIClient:
                    "max_tokens": self.config.get("max_tokens", 2048)}
         if tools is not None:
             payload["tools"] = tools
+        if payload["stream"] and self.config.get("stream_include_usage", False):
+            payload["stream_options"] = {"include_usage": True}
         try:
             body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
         except (ValueError, TypeError, RecursionError):
@@ -296,7 +361,7 @@ class OpenAIClient:
             raise ModelError("Model request size limit exceeded (model.max_request_bytes).")
         return payload, body
 
-    def _complete(self, messages, tools, on_text, deadline):
+    def _complete(self, messages, tools, on_text, deadline, progress):
         payload, body = self._prepare_request(messages, tools)
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream" if payload["stream"] else "application/json"}
         key_env = self.config.get("api_key_env", "")
@@ -309,6 +374,21 @@ class OpenAIClient:
         reply = None
         active_socket = [None]
         finished = threading.Event()
+        connect_timeout = self.config.get("connect_timeout_seconds", 0) or _remaining(deadline)
+        idle_timeout = self.config.get("idle_timeout_seconds", 0) or _remaining(deadline)
+        phase = ["connect", min(deadline, time.monotonic() + connect_timeout)]
+
+        def check_deadlines():
+            check_cancel(self.cancel_event)
+            _remaining(deadline)
+            if time.monotonic() >= phase[1]:
+                raise ModelError(f"Model {phase[0]} deadline exceeded.")
+
+        def activity():
+            # Completed headers, SSE lines (including heartbeats), or JSON body
+            # bytes are liveness, not evidence that the model is thinking.
+            check_deadlines()
+            phase[:] = ["idle", min(deadline, time.monotonic() + idle_timeout)]
 
         def expire():
             # shutdown interrupts buffered readline/read/getresponse even when
@@ -323,18 +403,15 @@ class OpenAIClient:
         timer = threading.Timer(_remaining(deadline), expire)
         timer.daemon = True
         timer.start()
-        def watch_cancel():
-            while not finished.wait(0.05):
-                if self.cancel_event is not None and self.cancel_event.is_set():
-                    # Cancellation stays active through socket replacement (TLS
-                    # wrapping detaches the old socket before publishing the new).
-                    # Retry until the request's finally block signals completion.
+        def watch_limits():
+            while not finished.wait(0.025):
+                if ((self.cancel_event is not None and self.cancel_event.is_set())
+                        or time.monotonic() >= phase[1]):
+                    # Keep checking through TLS socket replacement until finally.
                     expire()
 
-        watcher = None
-        if self.cancel_event is not None:
-            watcher = threading.Thread(target=watch_cancel, daemon=True, name="david-cancel")
-            watcher.start()
+        watcher = threading.Thread(target=watch_limits, daemon=True, name="david-cancel")
+        watcher.start()
         try:
             context = None
             if self.url.scheme == "https":
@@ -343,36 +420,51 @@ class OpenAIClient:
             host = self.url.hostname
             assert host is not None  # Validated before any network activity.
             conn = http.client.HTTPConnection(host, port, timeout=_remaining(deadline))
-            conn.sock = _connect(host, port, deadline, active_socket, context, self.cancel_event)
-            check_cancel(self.cancel_event)
+            progress("connecting")
+            conn.sock = _connect(host, port, phase[1], active_socket, context, self.cancel_event)
+            check_deadlines()
+            conn.sock.settimeout(_remaining(deadline))
+            activity()
             conn.request("POST", self.url.path.rstrip("/") + "/chat/completions",
                          body, headers)
+            progress("waiting")
             reply = conn.getresponse()
-            check_cancel(self.cancel_event)
+            activity()
             if reply.status != 200:
                 raise ModelError(f"Model HTTP request failed (status {reply.status}).")
             if payload["stream"]:
-                message = self._stream(reply, on_text)
-                check_cancel(self.cancel_event)
-                _remaining(deadline)
+                message = self._stream(reply, on_text, progress, activity)
+                check_deadlines()
                 return message
-            body = reply.read(self.max_response_bytes + 1)
-            check_cancel(self.cancel_event)
+            body = bytearray()
+            while len(body) <= self.max_response_bytes:
+                chunk = reply.read1(min(65536, self.max_response_bytes + 1 - len(body)))
+                check_deadlines()
+                if not chunk:
+                    break
+                activity()
+                body.extend(chunk)
+            body = bytes(body)
             if len(body) > self.max_response_bytes:
                 raise ModelError("Model response size limit exceeded.")
             if reply.length not in (None, 0):
                 raise ModelError("Model HTTP response was truncated.")
-            choice = _choice(_json(body))
+            obj = _json(body)
+            choice = _choice(obj)
+            self._record_usage(obj, progress)
             if choice is None:
                 _invalid()
             message = _message(choice.get("message"), choice.get("finish_reason"))
             if on_text and message.get("content"):
                 on_text(message["content"])
-            _remaining(deadline)
+            check_deadlines()
             return message
         except (OSError, http.client.HTTPException):
-            _remaining(deadline)
+            check_deadlines()
             raise ModelError("Model connection or TLS request failed.") from None
+        except ModelError:
+            check_deadlines()
+            raise
         finally:
             finished.set()
             if watcher is not None:
@@ -386,7 +478,7 @@ class OpenAIClient:
             if active_socket[0] is not None:
                 active_socket[0].close()
 
-    def _stream(self, reply, on_text):
+    def _stream(self, reply, on_text, progress, activity):
         texts = []
         calls = {}
         data = []
@@ -398,6 +490,7 @@ class OpenAIClient:
             raw = reply.readline(min(MAX_SSE_LINE_BYTES, self.max_response_bytes - total) + 1)
             if not raw:
                 break
+            activity()
             total += len(raw)
             event_bytes += len(raw)
             if (total > self.max_response_bytes or len(raw) > MAX_SSE_LINE_BYTES
@@ -417,7 +510,9 @@ class OpenAIClient:
                 if value == "[DONE]":
                     done = True
                     break
-                choice = _choice(_json(value), allow_usage=True)
+                obj = _json(value)
+                choice = _choice(obj, allow_usage=True)
+                self._record_usage(obj, progress)
                 if choice is None:
                     continue
                 if finish is not None:
@@ -427,6 +522,12 @@ class OpenAIClient:
                 if (not isinstance(delta, dict) or delta.get("role", "assistant") != "assistant"
                         or "function_call" in delta):
                     _invalid()
+                for field in ("reasoning_content", "reasoning"):
+                    reasoning = delta.get(field)
+                    if reasoning is not None and not isinstance(reasoning, str):
+                        _invalid()
+                    if reasoning:
+                        progress("thinking", activity=True, reasoning=True)
                 content = delta.get("content")
                 if content is not None and not isinstance(content, str):
                     _invalid()
@@ -437,6 +538,8 @@ class OpenAIClient:
                 items = delta.get("tool_calls", [])
                 if not isinstance(items, list) or len(items) > MAX_TOOL_CALLS:
                     _invalid()
+                if items:
+                    progress("generating", activity=True, tool=True)
                 for item in items:
                     if not isinstance(item, dict):
                         _invalid()

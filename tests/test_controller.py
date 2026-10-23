@@ -31,6 +31,88 @@ class ControllerTests(unittest.TestCase):
         self.controllers.append(result)
         return result
 
+    def test_usage_command_is_local_and_live_only_resets_on_session_boundaries(self):
+        from david.transport import OpenAIClient
+        from test_transport import response, serve
+        obj = json.loads(response())
+        obj['usage'] = {'prompt_tokens': 10, 'completion_tokens': 2, 'total_tokens': 12}
+        with serve(json.dumps(obj).encode()) as (url, requests):
+            controller = self.make(OpenAIClient({'base_url': url, 'name': 'fixture', 'stream': False}))
+            for prompt in ('hello', '/usage'):
+                controller.submit(prompt)
+                self.assertTrue(controller.wait(3))
+            self.assertEqual(len(requests), 1)
+            messages = [e['text'] for e in self.events if e['type'] == 'message']
+            self.assertIn('live-only', messages[-1])
+            self.assertIn('12', messages[-1])
+            self.assertIn('서버 보고', messages[-1])
+            done = [e for e in self.events if e.get('status') == 'done'][-1]
+            self.assertEqual(done['usage']['session']['tokens']['total_tokens'], 12)
+            self.assertEqual(done['context'], controller.agent.usage_snapshot()['context'])
+            controller.submit('/clear')
+            self.assertTrue(controller.wait(3))
+            self.assertEqual(controller.agent.usage_snapshot()['session']['requests'], 1)
+            controller.submit('/save on')
+            self.assertTrue(controller.wait(3))
+            saved_id = controller.session_id
+            for command in ('/new', '/resume ' + saved_id):
+                controller.submit(command)
+                self.assertTrue(controller.wait(3))
+                self.assertEqual(controller.agent.usage_snapshot()['session']['requests'], 0)
+            self.assertIn('/usage', controller.commands)
+
+    def test_attachment_preflight_failure_resets_turn_usage_but_keeps_session_spend(self):
+        from david.transport import OpenAIClient
+        from test_transport import response, serve
+        obj = json.loads(response())
+        obj['usage'] = {'prompt_tokens': 10, 'completion_tokens': 2, 'total_tokens': 12}
+        for path in ('missing.txt', 'oversize.txt', 'truncated.txt'):
+            with self.subTest(path=path), serve(json.dumps(obj).encode()) as (url, requests):
+                controller = self.make(OpenAIClient({'base_url': url, 'name': 'fixture', 'stream': False}))
+                empty_context = controller.agent.usage_snapshot()['context']
+                if path == 'oversize.txt':
+                    size = controller.agent.settings['security']['max_file_bytes'] + 1
+                    (self.workspace / path).write_bytes(b'x' * size)
+                elif path == 'truncated.txt':
+                    size = controller.agent.settings['security']['max_output_chars'] + 1
+                    (self.workspace / path).write_text('x' * size)
+                self.assertTrue(controller.submit('First successful turn'))
+                self.assertTrue(controller.wait(3))
+                previous = controller.agent.usage_snapshot()
+                self.assertEqual(previous['turn']['requests'], 1)
+                self.assertEqual(previous['turn']['tokens']['total_tokens'], 12)
+                self.assertIsNotNone(previous['request_usage'])
+
+                self.events.clear()
+                self.assertTrue(controller.submit('Read @' + path))
+                self.assertTrue(controller.wait(3))
+                terminal = [e for e in self.events if e.get('status') in ('done', 'error', 'cancelled')]
+                self.assertEqual(len(terminal), 1)
+                self.assertEqual(terminal[0]['status'], 'error')
+                failed = terminal[0]['usage']
+                self.assertEqual(failed['turn']['requests'], 0)
+                self.assertTrue(all(value is None for value in failed['turn']['tokens'].values()))
+                self.assertTrue(all(value == 0 for value in failed['turn']['reported_requests'].values()))
+                self.assertEqual(failed['turn']['incomplete_requests'], 0)
+                self.assertIsNone(failed['request_usage'])
+                self.assertEqual(failed['session'], previous['session'])
+                self.assertEqual(len(requests), 1)
+                # Existing failure handling clears history, not the system/tools
+                # context; report that available context rather than a fake zero.
+                self.assertEqual(controller.agent.history, [])
+                self.assertEqual(terminal[0]['context'], empty_context)
+                self.assertGreater(empty_context['estimated_input_tokens'], 0)
+                self.assertEqual(failed, controller.agent.usage_snapshot())
+
+                self.assertTrue(controller.submit('Next valid turn'))
+                self.assertTrue(controller.wait(3))
+                done = [e for e in self.events if e.get('status') == 'done'][-1]
+                self.assertEqual(done['usage']['turn']['requests'], 1)
+                self.assertEqual(done['usage']['turn']['tokens']['total_tokens'], 12)
+                self.assertEqual(done['usage']['session']['requests'], 2)
+                self.assertEqual(done['usage']['session']['tokens']['total_tokens'], 24)
+                self.assertEqual(len(requests), 2)
+
     def test_reload_rotates_session_and_does_not_carry_history_to_other_endpoint(self):
         controller = self.make(FakeClient({'role': 'assistant', 'content': 'private old reply'}))
         controller.submit('private old request')

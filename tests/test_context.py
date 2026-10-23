@@ -141,7 +141,7 @@ class ContextTests(unittest.TestCase):
         from david.transport import ModelError, OpenAIClient
         from test_transport import serve, response
         settings = deepcopy(DEFAULTS)
-        settings['model'].update(context_window_tokens=11238, max_request_bytes=6000,
+        settings['model'].update(context_window_tokens=11238, max_tokens=2048, max_request_bytes=6000,
                                  stream=False, api_key_env='')
         history = [[{'role': 'user', 'content': 'keep'}, {'role': 'assistant', 'content': 'kept'}]]
         prompt = 'a' * 7000

@@ -170,6 +170,7 @@ class AgentTests(unittest.TestCase):
     def test_history_is_trimmed_in_whole_turns_and_large_prompt_rejected(self):
         from david.agent import Agent, AgentError
         settings = deepcopy(DEFAULTS)
+        settings['model']['context_window_tokens'] = 0  # Explicit legacy character mode.
         settings['agent']['max_context_chars'] = 4096
         client = FakeClient(*[{'role': 'assistant', 'content': 'a' * 600} for _ in range(6)])
         agent = Agent(client, FakeTools(), settings)

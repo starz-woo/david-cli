@@ -190,6 +190,9 @@ def build_session(settings_path, workspace, read_only=False, *, skill_names=None
         raise ConfigError('Workspace must be an existing directory.')
     package = Path(__file__).resolve().parent
     protected = [settings_path, package, package.parent / 'david.py']
+    from .config import TOKENIZER_PATHS
+    for model_config in (settings['model'], *settings.get('model_profiles', {}).values()):
+        protected.extend(Path(model_config[k]).resolve() for k in TOKENIZER_PATHS if model_config.get(k))
     if sys.argv and Path(sys.argv[0]).is_file():
         protected.append(Path(sys.argv[0]).resolve())
     extra_prompt = ''
