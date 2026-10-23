@@ -85,8 +85,12 @@ def _message(message, finish):
     calls = message.get("tool_calls", [])
     if not isinstance(calls, list) or len(calls) > MAX_TOOL_CALLS:
         _invalid()
+    if finish == "length":
+        raise ModelError("Model reported a generation/context output limit (finish_reason=length). "
+                         "Review model.max_tokens and the server context limit; incomplete tools were not executed.")
     if finish != ("tool_calls" if calls else "stop"):
-        raise ModelError("Model response was incomplete or unsuccessful.")
+        raise ModelError("Model response has a missing, unsuccessful, or mismatched finish_reason; "
+                         "incomplete tools were not executed.")
     result = {"role": "assistant", "content": content}
     cleaned = []
     ids = set()
@@ -185,7 +189,8 @@ class OpenAIClient:
     network/client overhead and are NOT server TTFT or token-rate estimates.
     Instances are synchronous and not intended for concurrent complete calls.
 
-    Request bodies are capped at 2 MiB; response bodies at max_response_bytes
+    UTF-8 request bodies are capped at max_request_bytes (default 2 MiB, max
+    64 MiB); response bodies at max_response_bytes
     (default 2 MiB). SSE lines/events are each capped at 256 KiB. At most 16
     function calls are returned, with 64 KiB UTF-8 arguments per call. Arguments
     must be complete JSON objects, IDs unique, and stream indices contiguous.
@@ -201,6 +206,7 @@ class OpenAIClient:
         self.config = dict(model_config)
         self.cancel_event = cancel_event
         self.last_metrics = {"elapsed_seconds": 0.0, "first_text_seconds": None}
+        self.max_request_bytes = self.config.get("max_request_bytes", MAX_REQUEST_BYTES)
         self.max_response_bytes = self.config.get("max_response_bytes", 2 * 1024 * 1024)
         self._validate_config()
         try:
@@ -221,6 +227,9 @@ class OpenAIClient:
             raise ModelError("Invalid or unsafe model base URL.") from None
 
     def _validate_config(self):
+        if type(self.max_request_bytes) is not int or not 1024 <= self.max_request_bytes <= 64 * 1024 * 1024:
+            raise ModelError("Invalid model.max_request_bytes: expected 1024..67108864 bytes.")
+
         for name, default in (("stream", True), ("allow_insecure_http", False)):
             if type(self.config.get(name, default)) is not bool:
                 raise ModelError("Invalid model configuration.")
@@ -264,7 +273,11 @@ class OpenAIClient:
         finally:
             self.last_metrics["elapsed_seconds"] = time.monotonic() - start
 
-    def _complete(self, messages, tools, on_text, deadline):
+    def validate_request(self, messages, tools=None):
+        """Preflight the exact wire payload without sending a request."""
+        self._prepare_request(messages, tools)
+
+    def _prepare_request(self, messages, tools):
         if not isinstance(messages, list) or any(not isinstance(m, dict) for m in messages):
             raise ModelError("Invalid model request messages.")
         if tools is not None and (not isinstance(tools, list) or any(not isinstance(t, dict) for t in tools)):
@@ -276,11 +289,15 @@ class OpenAIClient:
         if tools is not None:
             payload["tools"] = tools
         try:
-            body = json.dumps(payload, allow_nan=False).encode()
+            body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
         except (ValueError, TypeError, RecursionError):
             raise ModelError("Invalid model request JSON.") from None
-        if len(body) > MAX_REQUEST_BYTES:
-            raise ModelError("Model request size limit exceeded.")
+        if len(body) > self.max_request_bytes:
+            raise ModelError("Model request size limit exceeded (model.max_request_bytes).")
+        return payload, body
+
+    def _complete(self, messages, tools, on_text, deadline):
+        payload, body = self._prepare_request(messages, tools)
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream" if payload["stream"] else "application/json"}
         key_env = self.config.get("api_key_env", "")
         if key_env:
@@ -447,8 +464,8 @@ class OpenAIClient:
                         if len(combined.encode("utf-8")) > limit:
                             raise ModelError("Model tool field size limit exceeded.")
                         call["function"][field] = combined
-        if not done or finish != ("tool_calls" if calls else "stop"):
-            raise ModelError("Model response was incomplete or unsuccessful.")
+        if not done:
+            raise ModelError("Model stream is missing framed [DONE]; incomplete tools were not executed.")
         message = {"role": "assistant", "content": "".join(texts) if texts else None}
         if calls:
             if sorted(calls) != list(range(len(calls))):

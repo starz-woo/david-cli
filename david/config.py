@@ -12,10 +12,13 @@ DEFAULTS = {
         'api_key_env': '', 'timeout_seconds': 90, 'max_tokens': 2048,
         'temperature': 0.2, 'stream': True, 'allow_insecure_http': False,
         'ca_file': '', 'max_response_bytes': 2097152,
+        # Explicit client budget, not endpoint discovery or a model capability claim.
+        # Zero preserves legacy agent.max_context_chars; positive replaces it.
+        'context_window_tokens': 0, 'max_request_bytes': 2097152,
     },
     'agent': {
         'tool_mode': 'native', 'max_steps': 12, 'max_context_chars': 60000,
-        'system_prompt_file': '',
+        'system_prompt_file': '', 'context_safety_margin_tokens': 1024,
     },
     'security': {
         'read_only': False, 'enable_commands': False,
@@ -87,12 +90,20 @@ def load_settings(path: Path) -> dict:
     for section, key, low, high, integer in (
         ('ui', 'input_height', 3, 15, True),
         ('model', 'timeout_seconds', 1, 600, False), ('model', 'max_tokens', 1, 131072, True),
+        ('model', 'context_window_tokens', 0, 2000000, True),
+        ('model', 'max_request_bytes', 1024, 67108864, True),
+        ('agent', 'context_safety_margin_tokens', 0, 2000000, True),
         ('model', 'temperature', 0, 2, False), ('model', 'max_response_bytes', 1024, 8388608, True),
         ('agent', 'max_steps', 1, 50, True), ('agent', 'max_context_chars', 4096, 1000000, True),
         ('security', 'max_file_bytes', 1024, 2097152, True), ('security', 'max_output_chars', 256, 65536, True),
         ('security', 'max_scan_entries', 1, 20000, True), ('security', 'command_output_bytes', 1024, 2097152, True),
     ):
         _number(result[section][key], low, high, f'{section}.{key}', integer)
+    window = result['model']['context_window_tokens']
+    reserve = result['model']['max_tokens'] + result['agent']['context_safety_margin_tokens']
+    if window and window <= reserve:
+        raise ConfigError('model.context_window_tokens must exceed model.max_tokens plus '
+                          'agent.context_safety_margin_tokens.')
     import re
     for name, recipe in result['commands'].items():
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', name):
