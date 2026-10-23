@@ -1,0 +1,63 @@
+{
+  "mcp": {"servers": {}},
+  "skills": {"registered": {}, "enabled": []},
+  "ui": {
+    "theme": "dark",
+    "input_height": 5
+  },
+  "model": {
+    "base_url": "http://127.0.0.1:11434/v1",
+    "name": "CHANGE_ME",
+    "api_key_env": "",
+    "timeout_seconds": 90,
+    "max_tokens": 2048,
+    "temperature": 0.2,
+    "stream": true,
+    "allow_insecure_http": false,
+    "ca_file": "",
+    "max_response_bytes": 2097152
+  },
+  "agent": {
+    "tool_mode": "native",
+    "max_steps": 12,
+    "max_context_chars": 60000,
+    "system_prompt_file": ""
+  },
+  "security": {
+    "read_only": false,
+    "enable_commands": false,
+    "max_file_bytes": 262144,
+    "max_output_chars": 16000,
+    "max_scan_entries": 2000,
+    "command_output_bytes": 131072,
+    "denied_names": [
+      ".git",
+      ".ssh",
+      ".aws",
+      ".env",
+      "setting.json"
+    ],
+    "denied_globs": [
+      ".env.*",
+      "*.pem",
+      "*.key",
+      "*.p12",
+      "*.pfx",
+      "*credentials*"
+    ]
+  },
+  "commands": {
+    "test": {
+      "argv": [
+        "{python}",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-v"
+      ],
+      "timeout_seconds": 60
+    }
+  }
+}

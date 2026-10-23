@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "david-coding-agent"
+version = "0.2.0"
+description = "A configurable coding CUI for user-managed internal LLM servers"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["prompt_toolkit>=3.0.50,<4", "pathspec>=0.12,<2"]
+
+[project.scripts]
+david = "david.cli:console_main"
+
+[tool.setuptools]
+packages = ["david"]
+py-modules = []
