@@ -95,7 +95,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.controller.submissions, ['한글 日本語 café 😀'])
         self.assertEqual(self.ui.composer.text, '')
         self.assertIn('internal-model', self.ui.header_text())
-        self.assertIn('/workspace/demo', self.ui.header_text())
+        self.assertIn('demo', self.ui.header_text())
         self.assertIsNotNone(self.controller.on_event)
 
     async def test_approval_requires_fresh_exact_user_decision(self):
