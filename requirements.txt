@@ -1,0 +1,3 @@
+# Source-development dependencies. Release ZIP users: use requirements-lock.txt offline.
+prompt_toolkit>=3.0.50,<4
+pathspec>=0.12,<2
