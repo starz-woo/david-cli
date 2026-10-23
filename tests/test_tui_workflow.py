@@ -96,14 +96,14 @@ class TuiWorkflowTests(unittest.TestCase):
                 'timeout_seconds': 5}}}))
             first = TerminalProcess(config, workspace, home)
             try:
-                first.expect('Message')
+                first.expect('❯')
                 first.send('sample.py 수정하고 테스트해줘\r')
                 first.expect('Approval')
                 first.send('\x19')
                 first.expect('"argv":')
                 first.send('\x19')
                 first.expect('TUI_WORKFLOW_DONE')
-                first.expect('done |')
+                first.expect('done')
                 first.send('/save on\r')
                 first.expect('saving')
                 first.quit()
@@ -119,7 +119,7 @@ class TuiWorkflowTests(unittest.TestCase):
             ident = records[0].stem
             second = TerminalProcess(config, workspace, home)
             try:
-                second.expect('Message')
+                second.expect('❯')
                 second.send('/resume ' + ident + '\r')
                 second.expect('복원 완료')
                 second.send('/undo\r')

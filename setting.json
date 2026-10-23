@@ -11,6 +11,8 @@
     "api_key_env": "",
     "timeout_seconds": 90,
     "max_tokens": 2048,
+    "context_window_tokens": 0,
+    "max_request_bytes": 2097152,
     "temperature": 0.2,
     "stream": true,
     "allow_insecure_http": false,
@@ -21,6 +23,7 @@
     "tool_mode": "native",
     "max_steps": 12,
     "max_context_chars": 60000,
+    "context_safety_margin_tokens": 1024,
     "system_prompt_file": ""
   },
   "security": {

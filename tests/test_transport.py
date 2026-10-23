@@ -76,6 +76,56 @@ def event(delta, finish=None):
 
 
 class TransportTests(unittest.TestCase):
+    def test_configured_large_requests_use_actual_utf8_wire_byte_limit(self):
+        from david.transport import ModelError, OpenAIClient
+        for text in ('a' * 2200000, '한' * 750000):
+            with self.subTest(character=text[0]), serve(response()) as (url, requests):
+                messages = [{'role': 'user', 'content': text}]
+                config = {'base_url': url, 'name': 'local', 'stream': False,
+                          'max_request_bytes': 8 * 1024 * 1024}
+                result = OpenAIClient(config).complete(messages)
+                self.assertEqual(result['content'], 'hello')
+                self.assertEqual(requests[0]['body']['messages'], messages)
+                body = json.dumps(requests[0]['body'], ensure_ascii=False, allow_nan=False).encode('utf-8')
+                size = len(body)
+                self.assertGreater(size, 2 * 1024 * 1024)
+                self.assertEqual(int(requests[0]['headers']['Content-Length']), size)
+                config['max_request_bytes'] = size
+                OpenAIClient(config).complete(messages)
+                config['max_request_bytes'] = size - 1
+                with self.assertRaisesRegex(ModelError, 'request size limit'):
+                    OpenAIClient(config).complete(messages)
+                config.pop('max_request_bytes')
+                with self.assertRaisesRegex(ModelError, 'request size limit'):
+                    OpenAIClient(config).complete(messages)
+                self.assertEqual(len(requests), 2)
+
+
+    def test_incomplete_diagnostics_distinguish_output_limit_framing_and_finish(self):
+        from david.transport import ModelError, OpenAIClient
+        call = {'id': 'x', 'type': 'function', 'function': {'name': 'read', 'arguments': '{'}}
+        cases = [
+            (False, response(reason='length'), 'output limit.*model.max_tokens'),
+            (False, response({'role': 'assistant', 'tool_calls': [call]}, 'length'), 'output limit'),
+            (False, response(reason='tool_calls'), 'finish_reason'),
+            (True, event({'content': 'preview'}, 'length') + b'data: [DONE]\n\n', 'output limit'),
+            (True, event({'tool_calls': [dict(call, index=0)]}, 'length') + b'data: [DONE]\n\n', 'output limit'),
+            (True, event({'content': 'preview'}, 'stop'), r'missing.*\[DONE\]'),
+            (True, event({'content': 'preview'}, 'tool_calls') + b'data: [DONE]\n\n', 'finish_reason'),
+        ]
+        for stream, body, diagnostic in cases:
+            with self.subTest(stream=stream, diagnostic=diagnostic), serve(body) as (url, requests):
+                with self.assertRaisesRegex(ModelError, diagnostic):
+                    OpenAIClient({'base_url': url, 'name': 'local', 'stream': stream}).complete([])
+                self.assertEqual(len(requests), 1)
+
+    def test_direct_client_validates_bounded_request_limit(self):
+        from david.transport import ModelError, OpenAIClient
+        for value in (True, 0, 1023, 67108865, 'large', 4096.5, None):
+            with self.subTest(value=value), self.assertRaises(ModelError):
+                OpenAIClient({'base_url': 'http://127.0.0.1/v1', 'name': 'local',
+                              'max_request_bytes': value})
+
     def test_wall_deadline_bounds_trickling_body_and_headers(self):
         from david.transport import ModelError, OpenAIClient
         for stream, slow_headers in [(True, False), (False, False), (True, True)]:
