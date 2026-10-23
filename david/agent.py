@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 import json
 import time
+from .context import context_usage
 
 SYSTEM_PROMPT = '''You are David, a coding assistant working in one explicitly selected workspace.
 Use the user's language. Read relevant code before editing. Use the supplied tools only.
@@ -73,16 +74,31 @@ class Agent:
             self.system += json.dumps(self.tools.schemas(), ensure_ascii=False)
 
     def _messages(self, turn):
+        retained = list(self.history)
         def assemble():
-            return [{'role': 'system', 'content': self.system}] + [m for t in self.history for m in t] + turn
+            return [{'role': 'system', 'content': self.system}] + [m for t in retained for m in t] + turn
         messages = assemble()
-        schema_size = len(json.dumps(self.tools.schemas(), ensure_ascii=False))
-        limit = self.settings['agent']['max_context_chars']
-        while self.history and len(json.dumps(messages, ensure_ascii=False)) + schema_size > limit:
-            self.history.pop(0)
+        token_mode = bool(self.settings['model'].get('context_window_tokens', 0))
+        schemas = None if token_mode and self.json_mode else self.tools.schemas()
+        count_key = 'estimated_input_tokens' if token_mode else 'input_characters'
+        limit_key = 'input_budget_tokens' if token_mode else 'input_budget_characters'
+        usage = context_usage(self.settings, messages, schemas)
+        while retained and usage[count_key] > usage[limit_key]:
+            retained.pop(0)
             messages = assemble()
-        if len(json.dumps(messages, ensure_ascii=False)) + schema_size > limit:
+            usage = context_usage(self.settings, messages, schemas)
+        if usage[count_key] > usage[limit_key]:
+            if token_mode:
+                raise AgentError('Estimated context token budget exceeded after reserving output and safety margin. '
+                                 'Use a smaller request or review configured limits; tokenizer counts may differ.')
             raise AgentError('Context character budget exceeded. Use /clear, a smaller request, or larger limits.')
+        # Keep trimming provisional until the transport accepts the wire payload.
+        # Lightweight/test clients may only implement complete().
+        validate_request = getattr(self.client, 'validate_request', None)
+        if validate_request is not None:
+            validate_request(messages, tools=None if self.json_mode else schemas)
+        self.history = retained
+        self.context_usage = usage
         return messages
 
     def _validate_calls(self, calls):
@@ -116,9 +132,15 @@ class Agent:
         for step in range(self.settings['agent']['max_steps']):
             self.cancel_check()
             messages = self._messages(turn)
-            size = len(json.dumps(messages, ensure_ascii=False)) + len(json.dumps(self.tools.schemas(), ensure_ascii=False))
-            self.on_event({'type': 'status', 'status': 'waiting', 'detail':
-                f"모델 응답 대기 · 요청 {step + 1} · 컨텍스트 {size}/{self.settings['agent']['max_context_chars']}자 (토큰 아님)"})
+            usage = self.context_usage
+            if usage['unit'] == 'estimated_tokens':
+                detail = (f"컨텍스트 ESTIMATE {usage['estimated_input_tokens']}/{usage['input_budget_tokens']} tokens "
+                          f"· window {usage['context_window_tokens']} · output reserve {usage['reserved_output_tokens']} "
+                          f"· margin {usage['safety_margin_tokens']} · {usage['method']}")
+            else:
+                detail = f"컨텍스트 {usage['input_characters']}/{usage['input_budget_characters']}자 (토큰 아님)"
+            self.on_event({'type': 'status', 'status': 'waiting', 'context': dict(usage),
+                          'detail': f"모델 응답 대기 · 요청 {step + 1} · {detail}"})
             chunks = []
             def stream(text):
                 self.cancel_check()

@@ -2,6 +2,8 @@
 import asyncio
 import json
 
+from bisect import bisect_right
+from functools import lru_cache
 from copy import deepcopy
 from queue import Empty, SimpleQueue
 from threading import Lock
@@ -20,24 +22,51 @@ from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.styles import Style
+from prompt_toolkit.layout.screen import Char
+from prompt_toolkit.formatted_text import fragment_list_to_text, to_formatted_text
 from prompt_toolkit.widgets import Frame, TextArea
 
 from .cli import safe_text
 from .file_refs import file_reference_prefix, quote_file_reference
 
 
+_TRUNCATION_MARKER = '[앞부분 생략]\n'
+
+
 THEMES = {
-    'dark': {'header': 'bg:#263445 #ffffff bold', 'status': 'bg:#263445 #b9d7ed',
-             'changes': '#92c99b', 'hint': '#888888', 'frame.border': '#526575',
-             'frame.label': '#b9d7ed bold', 'diff.add': '#8fdf9b', 'diff.remove': '#ff9494',
-             'diff.header': '#9fcef5 bold'},
-    'light': {'': 'bg:#ffffff #202932', 'header': 'bg:#edf2f7 #202932 bold',
-              'status': 'bg:#edf2f7 #234e70', 'changes': '#226b36', 'hint': '#555555',
-              'frame.border': '#80909e', 'frame.label': '#234e70 bold', 'diff.add': '#176d30',
-              'diff.remove': '#a52222', 'diff.header': '#234e70 bold'},
-    'mono': {'header': 'reverse bold', 'status': 'reverse', 'changes': 'bold',
-             'hint': '', 'frame.border': '', 'frame.label': 'bold', 'diff.add': 'underline',
-             'diff.remove': 'italic', 'diff.header': 'bold'},
+    'dark': {
+        '': 'bg:#101722 #dce4ed', 'header': 'bg:#192433 #e7edf5 bold',
+        'status': 'bg:#192433 #a6b9cc', 'changes': '#99c8ad', 'hint': '#8899ad',
+        'frame.border': '#394b60', 'frame.label': '#e2b880 bold',
+        'role.user': '#e2b880 bold', 'role.assistant': '#78cdd7 bold',
+        'role.system': '#93a4b8 bold', 'role.tool': '#b3a4d9 bold',
+        'rail.user': '#b18c61', 'rail.assistant': '#40838c', 'rail.system': '#394b60',
+        'rail.tool': '#70638c', 'body.system': '#93a4b8', 'body.tool': '#b8c5d4',
+        'heading': '#e7edf5 bold', 'code': 'bg:#182332 #b5d4e5', 'fence': '#738da5',
+        'diff.add': '#94d6a8', 'diff.remove': '#f49898', 'diff.header': '#8fc7eb bold',
+        'approval': '#e2b880 bold',
+    },
+    'light': {
+        '': 'bg:#fafbfc #263241', 'header': 'bg:#edf2f7 #202932 bold',
+        'status': 'bg:#edf2f7 #405770', 'changes': '#226b36', 'hint': '#596b7d',
+        'frame.border': '#b2bfcc', 'frame.label': '#865515 bold',
+        'role.user': '#865515 bold', 'role.assistant': '#096b78 bold',
+        'role.system': '#596b7d bold', 'role.tool': '#695091 bold',
+        'rail.user': '#ad834c', 'rail.assistant': '#4595a0', 'rail.system': '#b2bfcc',
+        'rail.tool': '#9883b4', 'body.system': '#596b7d', 'body.tool': '#405770',
+        'heading': '#202932 bold', 'code': 'bg:#eaf0f5 #284d6a', 'fence': '#657c91',
+        'diff.add': '#176d30', 'diff.remove': '#a52222', 'diff.header': '#234e70 bold',
+        'approval': '#865515 bold',
+    },
+    'mono': {
+        'header': 'reverse bold', 'status': 'reverse', 'changes': 'bold', 'hint': '',
+        'frame.border': '', 'frame.label': 'bold', 'role.user': 'bold',
+        'role.assistant': 'bold underline', 'role.system': 'italic', 'role.tool': 'bold',
+        'rail.user': '', 'rail.assistant': '', 'rail.system': '', 'rail.tool': '',
+        'body.system': '', 'body.tool': '', 'heading': 'bold', 'code': 'italic',
+        'fence': '', 'diff.add': 'underline', 'diff.remove': 'italic',
+        'diff.header': 'bold', 'approval': 'bold underline',
+    },
 }
 
 
@@ -50,6 +79,154 @@ class DiffLexer(Lexer):
                      'class:diff.remove' if text.startswith('-') else '')
             return [(style, text)]
         return line
+
+
+class TranscriptLexer(Lexer):
+    """Styles come from trusted entry metadata, never role-looking body text."""
+
+    def __init__(self, styles):
+        self.styles = tuple(styles)
+
+    def lex_document(self, document):
+        def line(number):
+            style = self.styles[number] if number < len(self.styles) else ''
+            return [(style, document.lines[number])]
+        return line
+
+
+class TranscriptWindow(Window):
+    """Scroll in rendered rows, independently of focus and the text cursor.
+
+    A logical line can occupy many screens. Window's default cursor-based
+    scrolling cannot preserve a reader's position inside that line.
+    """
+
+    def __init__(self, owner, **kwargs):
+        super().__init__(**kwargs)
+        self.owner = owner
+        self._content = None
+        self._document = Document('')
+        self._entry_starts = []
+        self._width = 1
+        self._height = 1
+        self._heights = {}
+
+    @staticmethod
+    @lru_cache(maxsize=4096)
+    def _cell_width(character):
+        # Match the renderer, including visible tab/control representations.
+        return Char(character, '').width
+
+    def _line_starts(self, row):
+        if row not in self._heights:
+            # Summed widths undercount rows when a wide glyph wraps with one
+            # cell left. Match the renderer and retain character anchors.
+            assert self._content is not None
+            prefix = fragment_list_to_text(to_formatted_text(self.get_line_prefix(row, 0))) if self.get_line_prefix else ''
+            prefix_width = sum(self._cell_width(c) for c in prefix)
+            column, index, starts = prefix_width, 0, [0]
+            for _, text, *_ in self._content.get_line(row):
+                for character in text:
+                    width = self._cell_width(character)
+                    if column + width > self._width:
+                        starts.append(index)
+                        column = prefix_width
+                    column += width
+                    index += 1
+            self._heights[row] = starts
+        return self._heights[row]
+
+    def _line_height(self, row):
+        return len(self._line_starts(row))
+
+    def _move(self, position, delta):
+        row, offset = position
+        offset += delta
+        while offset < 0 and row > 0:
+            row -= 1
+            offset += self._line_height(row)
+        while row < self._content.line_count - 1 and offset >= self._line_height(row):
+            offset -= self._line_height(row)
+            row += 1
+        return row, max(0, min(offset, self._line_height(row) - 1))
+
+    def _bottom(self):
+        last = self._content.line_count - 1
+        return self._move((last, self._line_height(last) - 1), -(self._height - 1))
+
+    def _scroll(self, ui_content, width, height):
+        anchor = None
+        row = self.vertical_scroll
+        if not self.owner.follow_output and self._content is not None:
+            starts = self._line_starts(min(row, self._content.line_count - 1))
+            anchor = starts[min(self.vertical_scroll_2, len(starts) - 1)]
+            # The old rendered row belongs to an entry, not a permanent buffer
+            # index. Eviction (and its notice) shifts all surviving entries.
+            for entry, start, removed in reversed(self._entry_starts):
+                if start <= row:
+                    new_start = next((line for item, line, _ in self.owner._entry_starts
+                                      if item is entry), None)
+                    if new_start is None:
+                        # The reader's entry expired: stay paused at the oldest
+                        # retained output instead of jumping towards the tail.
+                        row, anchor = 0, 0
+                    else:
+                        delta = entry.get('_text_offset', 0) - removed
+                        if delta and row > start:
+                            # Offsets count characters, including newlines and the
+                            # inserted marker, not logical lines or display cells.
+                            offset = (self._document.translate_row_col_to_index(row, anchor)
+                                      - self._document.translate_row_col_to_index(start + 1, 0)
+                                      - delta)
+                            if offset < len(_TRUNCATION_MARKER):
+                                row, anchor = 0, 0
+                            else:
+                                document = self.owner.transcript.buffer.document
+                                index = document.translate_row_col_to_index(new_start + 1, 0) + offset
+                                row, anchor = document.translate_index_to_position(index)
+                        else:
+                            row += new_start - start
+                    break
+        self._content = ui_content
+        self._document = self.owner.transcript.buffer.document
+        self._entry_starts = self.owner._entry_starts
+        self._heights.clear()
+        self._width, self._height = max(1, width), max(1, height)
+        self.vertical_scroll = min(row, ui_content.line_count - 1)
+        if anchor is not None:
+            starts = self._line_starts(self.vertical_scroll)
+            self.vertical_scroll_2 = max(0, bisect_right(starts, anchor) - 1)
+        self.horizontal_scroll = 0
+        bottom = self._bottom()
+        if self.owner.follow_output:
+            position = bottom
+        else:
+            row = min(self.vertical_scroll, ui_content.line_count - 1)
+            position = min((row, min(self.vertical_scroll_2, self._line_height(row) - 1)), bottom)
+        self.vertical_scroll, self.vertical_scroll_2 = position
+
+    def scroll_rows(self, amount):
+        if self._content is None:
+            return
+        position = self._move((self.vertical_scroll, self.vertical_scroll_2), amount)
+        bottom = self._bottom()
+        if amount > 0 and position >= bottom:
+            self.owner.return_to_latest()
+        else:
+            self.owner.follow_output = False
+            self.vertical_scroll, self.vertical_scroll_2 = min(position, bottom)
+            # Cursor is only a selection/navigation aid, never the follow state.
+            document = self.owner.transcript.buffer.document
+            self.owner.transcript.buffer.cursor_position = document.translate_row_col_to_index(
+                self.vertical_scroll, min(len(document.lines[self.vertical_scroll]),
+                                          self._line_starts(self.vertical_scroll)[self.vertical_scroll_2]))
+        self.owner.application.invalidate()
+
+    def _scroll_up(self):
+        self.scroll_rows(-3)
+
+    def _scroll_down(self):
+        self.scroll_rows(3)
 
 
 class WorkspaceCompleter(Completer):
@@ -92,10 +269,14 @@ class DavidTUI:
         self._approval_epoch = 0
         self._shown_approval_epoch = None
         self._entries = []
+        self._entry_starts = []
+        self._line_prefixes = []
         self._trimmed = False
         self.changes = []
         self.show_tool_details = False
         self._stream_index = None
+        self.follow_output = True
+        self.unseen_output = False
         self.approval = None
         self.approval_panel = TextArea(read_only=True, scrollbar=True, wrap_lines=True, lexer=DiffLexer(),
                                        height=Dimension(min=1, preferred=7, max=12))
@@ -109,10 +290,14 @@ class DavidTUI:
         self.session_id = controller.session_id
         self.saving = controller.saving
         self.transcript = TextArea(read_only=True, scrollbar=True, wrap_lines=True)
+        self.transcript.window = TranscriptWindow(
+            self, content=self.transcript.control, wrap_lines=True,
+            right_margins=self.transcript.window.right_margins,
+            get_line_prefix=self._transcript_prefix, height=Dimension(min=1))
         self.completer = WorkspaceCompleter(controller)
         self.composer = TextArea(multiline=True, wrap_lines=True,
                                  completer=self.completer, complete_while_typing=False,
-                                 height=Dimension(min=1, preferred=height, max=max(height, 8)))
+                                 height=Dimension(min=1, preferred=height, max=height))
         bindings = KeyBindings()
         editing = has_focus(self.composer)
         self.composer.buffer.on_text_changed += self._sanitize_composer
@@ -159,20 +344,23 @@ class DavidTUI:
 
         @bindings.add('pageup')
         def page_up(event):
-            if not self.application.layout.has_focus(self.approval_panel):
-                self.application.layout.focus(self.transcript)
-            scroll_page_up(event)
+            if self.application.layout.has_focus(self.approval_panel):
+                scroll_page_up(event)
+            else:
+                window = self.transcript.window
+                window.scroll_rows(-max(1, window._height - 1))
 
         @bindings.add('pagedown')
         def page_down(event):
-            if not self.application.layout.has_focus(self.approval_panel):
-                self.application.layout.focus(self.transcript)
-            buffer = self.application.current_buffer
-            previous = buffer.cursor_position
-            scroll_page_down(event)
-            if buffer.cursor_position <= previous:
-                info = self.application.layout.current_window.render_info
-                buffer.cursor_down(count=max(1, info.window_height - 1) if info else 1)
+            if self.application.layout.has_focus(self.approval_panel):
+                scroll_page_down(event)
+            else:
+                window = self.transcript.window
+                window.scroll_rows(max(1, window._height - 1))
+
+        @bindings.add('c-end')
+        def latest(event):
+            self.return_to_latest()
 
         @bindings.add('c-c')
         def cancel(event):
@@ -194,14 +382,16 @@ class DavidTUI:
                 Window(FormattedTextControl(self.header_text), height=1, style='class:header'),
                 self.transcript,
                 ConditionalContainer(
-                    Frame(self.approval_panel, title='Approval · yes / no · Ctrl+Y / Ctrl+N'),
+                    Frame(self.approval_panel, title='Approval · yes / no · Ctrl+Y / Ctrl+N',
+                          style='class:approval'),
                     filter=Condition(lambda: self.approval is not None)),
-                Window(FormattedTextControl(self.changes_text), height=1, style='class:changes'),
-                Frame(self.composer, title='Message · Enter send'),
+                ConditionalContainer(
+                    Window(FormattedTextControl(self.changes_text), height=1, style='class:changes'),
+                    Condition(lambda: bool(self.changes))),
+                Frame(self.composer, title='Message · YOU / 나 · Enter send'),
                 Window(FormattedTextControl(self.status_text), height=1, style='class:status'),
                 Window(FormattedTextControl(
-                    'Enter send · Alt+Enter/Ctrl+J newline · Ctrl+S send · Ctrl+C cancel · Ctrl+Q quit · '
-                    'Tab complete/focus · Shift+Tab back · PgUp/PgDn scroll · Ctrl+O tools'),
+                    '  Alt+Enter newline · PgUp history · Ctrl+C stop · Ctrl+Q quit · /help'),
                     height=1, style='class:hint'),
             ])
         compact = HSplit([
@@ -239,8 +429,12 @@ class DavidTUI:
         return self.application.output.get_size()
 
     def header_text(self):
-        return safe_text(f'David | {self.controller.model_name} | {self.controller.workspace}'
-                         f' | session {self.session_id}')
+        # Show identity, not a potentially screen-wide absolute Windows path.
+        workspace = str(self.controller.workspace).replace('\\', '/').rstrip('/').rsplit('/', 1)[-1]
+        workspace = ' '.join(safe_text(workspace).split())
+        model = ' '.join(safe_text(self.controller.model_name).split())
+        session = ' '.join(safe_text(self.session_id).split())
+        return f'  DAVID  /  {workspace}  ·  {model}  ·  {session}'
 
     def changes_text(self):
         if not self.changes:
@@ -257,7 +451,16 @@ class DavidTUI:
         return safe_text('Changes: ' + ' | '.join(items))
 
     def status_text(self):
-        return safe_text(f'{self.status} | {self.detail}' + (' | saving ON (평문)' if self.saving else ' | 저장 OFF'))
+        paused = ('Paused · ' + ('new output · ' if self.unseen_output else '') + 'Ctrl+End latest | ') if not self.follow_output else ''
+        detail = (self.detail + ' | ') if self.detail else ''
+        storage = 'saving ON (평문)' if self.saving else '저장 OFF'
+        return safe_text('  ' + paused + f'{self.status} | ' + detail + storage)
+
+    def return_to_latest(self):
+        self.follow_output = True
+        self.unseen_output = False
+        self.transcript.buffer.cursor_position = len(self.transcript.text)
+        self.application.invalidate()
 
     def cancel(self):
         if self.controller.busy or self._submitting or self.approval is not None:
@@ -314,6 +517,7 @@ class DavidTUI:
             self.request_close()
             return
         if not self._stopping and not self._submitting and text.strip():
+            self.return_to_latest()
             self._cancel_requested = False
             self._submitting = True
             self.application.create_background_task(self._submit(text, self._composer_revision))
@@ -365,7 +569,9 @@ class DavidTUI:
 
     def _drain_events(self, application):
         changed = False
-        while True:
+        # Keep keyboard/cancellation responsive during a burst. Preserve FIFO,
+        # including approvals and resets; never discard control events.
+        for _ in range(128):
             try:
                 event = self._events.get_nowait()
             except Empty:
@@ -373,6 +579,8 @@ class DavidTUI:
             changed = True
             kind = event.get('type')
             if kind == 'reset':
+                self.follow_output = True
+                self.unseen_output = False
                 self._entries.clear()
                 self._trimmed = False
                 self.changes = []
@@ -394,6 +602,7 @@ class DavidTUI:
                 text = safe_text(event.get('text', ''))
                 if role == 'assistant' and self._stream_index is not None:
                     self._entries[self._stream_index]['text'] = text
+                    self._entries[self._stream_index]['_text_offset'] = 0
                 else:
                     self._entries.append({'role': role, 'text': text})
                 self._stream_index = None
@@ -437,13 +646,23 @@ class DavidTUI:
                 self.composer.buffer.document = Document(text, len(text))
         if changed:
             self._render_transcript()
+        if not self._events.empty():
+            self.application.invalidate()
+
+    def _transcript_prefix(self, line, wrap_count):
+        if line < len(self._line_prefixes):
+            return [self._line_prefixes[line]]
+        return [('', '  ')]
 
     def _render_transcript(self):
         # Bound both retained data and rendering cost on long coding sessions.
         for entry in self._entries:
             for key in ('text', 'details'):
                 if len(entry.get(key, '')) > 100000:
-                    entry[key] = '[앞부분 생략]\n' + entry[key][-99980:]
+                    if key == 'text':
+                        entry['_text_offset'] = (entry.get('_text_offset', 0)
+                                                 + len(entry[key]) - 99980 - len(_TRUNCATION_MARKER))
+                    entry[key] = _TRUNCATION_MARKER + entry[key][-99980:]
                     self._trimmed = True
         size = sum(len(e.get('text', '')) + len(e.get('details', '')) + 100 for e in self._entries)
         while self._entries and (size > 200000 or len(self._entries) > 300):
@@ -452,18 +671,48 @@ class DavidTUI:
             if self._stream_index is not None:
                 self._stream_index = self._stream_index - 1 if self._stream_index else None
             self._trimmed = True
-        parts = []
+        lines, styles, prefixes, entry_starts = [], [], [], []
+
+        def add(text, style='', prefix=('', '  ')):
+            lines.append(text)
+            styles.append(style)
+            prefixes.append(prefix)
+
         if self._trimmed:
-            parts.append('[화면 기록 한도로 오래된 출력 생략 · 저장 세션과 모델 컨텍스트 한도는 별도]')
+            add('[화면 기록 한도로 오래된 출력 생략 · 저장 세션과 모델 컨텍스트 한도는 별도]',
+                'class:body.system')
         for entry in self._entries:
+            if lines:
+                add('')
+            entry_starts.append((entry, len(lines), entry.get('_text_offset', 0)))
+            role = entry['role']
+            category = role if role in ('user', 'assistant') else 'tool' if role.startswith('tool ') else 'system'
+            label = {'user': 'YOU / 나', 'assistant': 'DAVID', 'system': 'NOTICE / 안내',
+                     'summary': 'TURN / 요약'}.get(role, 'TOOL · ' + role[5:] if category == 'tool' else role.upper())
+            add(label, 'class:role.' + category)
             text = entry['text']
             if 'details' in entry:
                 text += ('\n' + entry['details']) if self.show_tool_details else ' [Ctrl+O details]'
-            parts.append(f"{entry['role']}> {text}")
-        text = '\n\n'.join(parts)
+            in_code = False
+            for body_line in text.split('\n'):
+                style = 'class:body.' + category
+                if category == 'assistant':
+                    if body_line.lstrip().startswith(('```', '~~~')):
+                        style = 'class:fence'
+                        in_code = not in_code
+                    elif in_code:
+                        style = 'class:code'
+                    elif body_line.startswith(('# ', '## ', '### ', '#### ')):
+                        style = 'class:heading'
+                add(body_line, style, ('class:rail.' + category, '  │ '))
+        text = '\n'.join(lines)
+        self._line_prefixes = prefixes
+        self._entry_starts = entry_starts
+        self.transcript.lexer = TranscriptLexer(styles)
         buffer = self.transcript.buffer
-        follow = buffer.cursor_position == len(buffer.text)
-        cursor = len(text) if follow else min(buffer.cursor_position, len(text))
+        if not self.follow_output and text != buffer.text:
+            self.unseen_output = True
+        cursor = len(text) if self.follow_output else min(buffer.cursor_position, len(text))
         buffer.set_document(Document(text, cursor), bypass_readonly=True)
 
 
