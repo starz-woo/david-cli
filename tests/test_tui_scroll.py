@@ -41,6 +41,87 @@ class ChatViewportTests(unittest.IsolatedAsyncioTestCase):
         self.pipe.send_text(keys)
         await self.render()
 
+    async def test_expanded_state_details_share_the_transcript_render_budget(self):
+        self.controller.on_event({'type': 'message', 'role': 'assistant', 'text': 'x' * 90000})
+        self.controller.on_event({'type': 'message', 'role': 'assistant', 'text': 'y' * 90000})
+        self.controller.on_event({'type': 'status', 'status': 'error', 'detail': 'z' * 100000})
+        await self.render()
+        await self.send('\x0f')
+        self.assertLessEqual(len(self.ui.transcript.text), 220000)
+        self.assertIn('생략', self.ui.transcript.text)
+
+    async def test_state_details_wrap_and_remain_inspectable_in_compact_layout(self):
+        detail = 'context estimate ' + '한글 ' * 30 + 'DETAIL-END'
+        self.controller.on_event({'type': 'status', 'status': 'reading', 'detail': detail})
+        await self.render()
+        self.assertIn('DETAIL-END', self.screen())
+        self.output.get_size = lambda: Size(rows=12, columns=38)
+        self.ui.application._on_resize()
+        await self.render()
+        self.assertIn('reading', self.screen())
+        # Ctrl+O is the existing details toggle; long state text is scrollable
+        # alongside tool details rather than silently clipped by a status bar.
+        await self.send('\x0f')
+        self.assertIn(detail, self.ui.transcript.text)
+        self.assertIn('DETAIL-END', self.screen())
+        self.assertTrue(self.ui.application.layout.has_focus(self.ui.composer))
+
+    async def test_minimal_chrome_keeps_real_status_details_and_save_state_visible(self):
+        await self.render()
+        idle = self.screen()
+        self.assertNotIn('idle |', idle)
+        self.assertIn('/help', idle)
+        self.assertIn('Ctrl+C stop', idle)
+        self.assertIn('저장 OFF', idle)
+        self.assertNotIn('Working', idle)
+        self.assertNotIn('test-session', idle)
+        self.controller.on_event({'type': 'status', 'status': 'running',
+                                  'detail': 'context estimate 1234; not provider usage'})
+        await self.render()
+        self.assertIn('✳ running', self.screen())
+        self.assertIn('context estimate 1234', self.screen())
+        self.controller.on_event({'type': 'status', 'status': 'done',
+                                  'detail': 'context estimate 1300'})
+        self.controller.on_event({'type': 'session', 'id': 'hidden-uuid', 'saving': True})
+        await self.render()
+        self.assertNotIn('✳', self.screen())
+        self.assertIn('context estimate 1300', self.screen())
+        self.assertIn('saving ON (평문)', self.screen())
+        self.assertNotIn('hidden-uuid', self.screen())
+        from david.tui import THEMES
+        for theme in ('dark', 'light'):
+            # Roles remain legible without multicolored heading cards.
+            self.assertIn('bg:', THEMES[theme]['body.user'])
+            self.assertNotIn('bg:', THEMES[theme]['header'])
+            self.assertNotIn('bg:', THEMES[theme]['role.assistant'])
+            self.assertEqual(THEMES[theme]['title'], THEMES[theme]['working'])
+        self.assertNotEqual(THEMES['dark']['body.user'], THEMES['dark'][''])
+
+    async def test_composer_grows_from_one_row_with_rules_and_no_message_frame(self):
+        await self.render()
+        self.assertEqual(self.ui.composer.window.render_info.window_height, 1)
+        self.assertNotIn('Message', self.screen())
+        self.assertNotIn('YOU / 나', self.screen())
+        self.assertNotIn('test-session', self.screen())
+        self.assertIn('David', self.screen())
+        info = self.ui.composer.window.render_info
+        rows = self.screen().splitlines()
+        self.assertTrue(rows[info._y_offset - 1].startswith('──'))
+        self.assertTrue(rows[info._y_offset + 1].startswith('──'))
+        self.assertTrue(rows[info._y_offset].startswith('❯ '))
+        await self.send('one\ntwo\nthree')
+        self.assertEqual(self.ui.composer.window.render_info.window_height, 3)
+        self.ui.composer.text = '\n'.join(str(i) for i in range(12))
+        await self.render()
+        self.assertEqual(self.ui.composer.window.render_info.window_height, 5)
+        self.ui.composer.text = ''
+        await self.render()
+        self.assertEqual(self.ui.composer.window.render_info.window_height, 1)
+        # Soft wrapping (including wide glyphs) must grow the same real window.
+        self.ui.composer.text = '한' * 60
+        await self.render()
+        self.assertEqual(self.ui.composer.window.render_info.window_height, 2)
+
     async def test_paused_viewport_stays_on_retained_messages_across_eviction(self):
         self.controller.on_event({'type': 'reset'})
         for i in range(300):
@@ -179,7 +260,7 @@ class ChatViewportTests(unittest.IsolatedAsyncioTestCase):
             while 'MESSAGE-299' not in self.screen():
                 await asyncio.sleep(.02)
         self.ui.transcript.window.scroll_rows(-10000)
-        self.ui.transcript.window.scroll_rows(30)
+        self.ui.transcript.window.scroll_rows(20)
         await self.render()
         self.assertIn('MESSAGE-010', self.screen())
         for i in range(300, 330):
@@ -273,34 +354,68 @@ class ChatViewportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('RESTORED-END', self.screen())
         self.assertNotIn('Paused', self.screen())
 
+    async def test_banner_renders_root_and_windows_workspace_identity(self):
+        from pathlib import Path
+        from prompt_toolkit.application.current import set_app
+
+        original_workspace = self.controller.workspace
+        original_model = self.controller.model_name
+        cases = [
+            (Path('/'), 'internal-model', 'internal-model · /'),
+            (Path('C:/work/demo'), 'internal-model', 'internal-model · demo'),
+            (Path(r'C:\work\demo'), 'internal-model', 'internal-model · demo'),
+            (Path('/work/demo'), 'model  ·  extra\x1b', r'model · extra\u001b · demo'),
+        ]
+        try:
+            for workspace, model, identity in cases:
+                with self.subTest(workspace=workspace, model=model):
+                    self.controller.workspace = workspace
+                    self.controller.model_name = model
+                    # Render synchronously in the running app so a banner exception
+                    # fails here, rather than escaping into the redraw callback.
+                    with set_app(self.ui.application):
+                        self.ui.application._redraw()
+                    lines = self.screen().splitlines()
+                    self.assertEqual(lines[0].strip(), 'David')
+                    self.assertEqual(lines[1].strip(), identity)
+                    self.assertIn('❯', self.screen())
+                    self.assertIn('/help', self.screen())
+                    self.assertTrue(self.ui.application.layout.has_focus(self.ui.composer))
+        finally:
+            self.controller.workspace = original_workspace
+            self.controller.model_name = original_model
+
     async def test_compact_header_keeps_identity_without_long_workspace_noise(self):
         from pathlib import Path
         self.controller.workspace = Path('/very/long/organization/project/directory/demo')
         self.controller.on_event({'type': 'session', 'id': 'session-1234', 'saving': False})
         await self.render()
         header = self.ui.header_text()
-        self.assertIn('DAVID', header)
+        self.assertIn('David', header)
         self.assertIn('demo', header)
         self.assertIn('internal-model', header)
-        self.assertIn('session-1234', header)
+        self.assertNotIn('session-1234', header)
         self.assertNotIn('/very/long', header)
         self.assertNotIn('|  |', self.ui.status_text())
 
-    async def test_role_cards_have_trusted_labels_and_safe_heading_code_styles(self):
+    async def test_flowing_transcript_has_trusted_prefixes_and_safe_heading_code_styles(self):
         self.controller.on_event({'type': 'reset'})
         self.controller.on_event({'type': 'message', 'role': 'user', 'text': '한글 request'})
         self.controller.on_event({'type': 'message', 'role': 'assistant',
                                   'text': '# Plan\nYOU / 나\n```python\nprint("<b>safe</b>")\n```'})
+        self.controller.on_event({'type': 'tool', 'name': 'read_file', 'result': {'ok': True}})
         await self.render()
-        self.assertIn('YOU / 나', self.screen())
-        self.assertIn('DAVID', self.screen())
-        self.assertIn('한글 request', self.screen())
+        self.assertIn('❯ 한글 request', self.screen())
+        self.assertIn('● # Plan', self.screen())
+        self.assertIn('● read_file', self.screen())
+        self.assertIn('  ⎿ done', self.screen())
+        self.assertNotIn('│', '\n'.join(self.transcript_rows()))
         lexer = self.ui.transcript.control.lexer.lex_document(self.ui.transcript.buffer.document)
         lines = self.ui.transcript.text.splitlines()
-        user_labels = [i for i, text in enumerate(lines) if text == 'YOU / 나']
-        self.assertEqual(len(user_labels), 2)
-        self.assertIn('role.user', lexer(user_labels[0])[0][0])
-        self.assertNotIn('role.user', lexer(user_labels[1])[0][0])
+        self.assertNotIn('DAVID', lines)
+        self.assertEqual(lines.count('YOU / 나'), 1, 'body text must not become a role label')
+        self.assertIn('body.user', lexer(lines.index('한글 request'))[0][0])
+        self.assertNotIn('role.user', lexer(lines.index('YOU / 나'))[0][0])
         self.assertIn('heading', lexer(lines.index('# Plan'))[0][0])
         self.assertIn('code', lexer(lines.index('print("<b>safe</b>")'))[0][0])
         self.assertIn('<b>safe</b>', self.screen())
@@ -335,7 +450,7 @@ class ChatViewportTests(unittest.IsolatedAsyncioTestCase):
             if self.ui.follow_output:
                 break
         self.assertTrue(self.ui.follow_output)
-        self.assertIn('MORE-TAIL', self.screen())
+        self.assertIn('MORE-TAIL', ''.join(row[2:].rstrip() for row in self.transcript_rows()))
         self.controller.on_event({'type': 'text', 'text': '\nAFTER-PAGEDOWN'})
         await self.render()
         self.assertIn('AFTER-PAGEDOWN', self.screen())

@@ -35,34 +35,33 @@ _TRUNCATION_MARKER = '[앞부분 생략]\n'
 
 THEMES = {
     'dark': {
-        '': 'bg:#101722 #dce4ed', 'header': 'bg:#192433 #e7edf5 bold',
-        'status': 'bg:#192433 #a6b9cc', 'changes': '#99c8ad', 'hint': '#8899ad',
-        'frame.border': '#394b60', 'frame.label': '#e2b880 bold',
-        'role.user': '#e2b880 bold', 'role.assistant': '#78cdd7 bold',
-        'role.system': '#93a4b8 bold', 'role.tool': '#b3a4d9 bold',
-        'rail.user': '#b18c61', 'rail.assistant': '#40838c', 'rail.system': '#394b60',
-        'rail.tool': '#70638c', 'body.system': '#93a4b8', 'body.tool': '#b8c5d4',
-        'heading': '#e7edf5 bold', 'code': 'bg:#182332 #b5d4e5', 'fence': '#738da5',
-        'diff.add': '#94d6a8', 'diff.remove': '#f49898', 'diff.header': '#8fc7eb bold',
-        'approval': '#e2b880 bold',
+        '': 'bg:#262624 #deded8', 'header': '#999991',
+        'title': '#d99572 bold', 'working': '#d99572 bold',
+        'changes': '#a6af98', 'hint': '#999991',
+        'frame.border': '#676761', 'frame.label': '#d99572 bold',
+        'role.user': 'bg:#353532 #eeeeea bold', 'body.user': 'bg:#353532 #eeeeea',
+        'role.assistant': '#deded8', 'role.system': '#999991', 'role.tool': '#deded8 bold',
+        'body.system': '#999991', 'body.tool': '#a9a9a1',
+        'heading': '#eeeeea bold', 'code': '#c5c5bd', 'fence': '#999991',
+        'diff.add': '#a6c58b', 'diff.remove': '#dc9490', 'diff.header': '#deded8 bold',
+        'approval': '#d99572 bold',
     },
     'light': {
-        '': 'bg:#fafbfc #263241', 'header': 'bg:#edf2f7 #202932 bold',
-        'status': 'bg:#edf2f7 #405770', 'changes': '#226b36', 'hint': '#596b7d',
-        'frame.border': '#b2bfcc', 'frame.label': '#865515 bold',
-        'role.user': '#865515 bold', 'role.assistant': '#096b78 bold',
-        'role.system': '#596b7d bold', 'role.tool': '#695091 bold',
-        'rail.user': '#ad834c', 'rail.assistant': '#4595a0', 'rail.system': '#b2bfcc',
-        'rail.tool': '#9883b4', 'body.system': '#596b7d', 'body.tool': '#405770',
-        'heading': '#202932 bold', 'code': 'bg:#eaf0f5 #284d6a', 'fence': '#657c91',
-        'diff.add': '#176d30', 'diff.remove': '#a52222', 'diff.header': '#234e70 bold',
-        'approval': '#865515 bold',
+        '': 'bg:#faf9f5 #343430', 'header': '#74746b',
+        'title': '#a95432 bold', 'working': '#a95432 bold',
+        'changes': '#506a3f', 'hint': '#74746b',
+        'frame.border': '#b6b6ac', 'frame.label': '#a95432 bold',
+        'role.user': 'bg:#eae9e2 #242420 bold', 'body.user': 'bg:#eae9e2 #242420',
+        'role.assistant': '#343430', 'role.system': '#74746b', 'role.tool': '#343430 bold',
+        'body.system': '#74746b', 'body.tool': '#67675d',
+        'heading': '#242420 bold', 'code': '#505047', 'fence': '#74746b',
+        'diff.add': '#3e6c2e', 'diff.remove': '#a23932', 'diff.header': '#343430 bold',
+        'approval': '#a95432 bold',
     },
     'mono': {
-        'header': 'reverse bold', 'status': 'reverse', 'changes': 'bold', 'hint': '',
-        'frame.border': '', 'frame.label': 'bold', 'role.user': 'bold',
-        'role.assistant': 'bold underline', 'role.system': 'italic', 'role.tool': 'bold',
-        'rail.user': '', 'rail.assistant': '', 'rail.system': '', 'rail.tool': '',
+        'header': '', 'title': 'bold', 'working': 'bold', 'changes': '', 'hint': '',
+        'frame.border': '', 'frame.label': 'bold', 'role.user': 'reverse bold',
+        'body.user': 'reverse', 'role.assistant': '', 'role.system': 'italic', 'role.tool': 'bold',
         'body.system': '', 'body.tool': '', 'heading': 'bold', 'code': 'italic',
         'fence': '', 'diff.add': 'underline', 'diff.remove': 'italic',
         'diff.header': 'bold', 'approval': 'bold underline',
@@ -162,9 +161,9 @@ class TranscriptWindow(Window):
             anchor = starts[min(self.vertical_scroll_2, len(starts) - 1)]
             # The old rendered row belongs to an entry, not a permanent buffer
             # index. Eviction (and its notice) shifts all surviving entries.
-            for entry, start, removed in reversed(self._entry_starts):
+            for entry, start, removed, body_start in reversed(self._entry_starts):
                 if start <= row:
-                    new_start = next((line for item, line, _ in self.owner._entry_starts
+                    new_start = next((line for item, line, _, _body in self.owner._entry_starts
                                       if item is entry), None)
                     if new_start is None:
                         # The reader's entry expired: stay paused at the oldest
@@ -172,17 +171,18 @@ class TranscriptWindow(Window):
                         row, anchor = 0, 0
                     else:
                         delta = entry.get('_text_offset', 0) - removed
-                        if delta and row > start:
+                        if delta and row >= body_start:
                             # Offsets count characters, including newlines and the
                             # inserted marker, not logical lines or display cells.
                             offset = (self._document.translate_row_col_to_index(row, anchor)
-                                      - self._document.translate_row_col_to_index(start + 1, 0)
+                                      - self._document.translate_row_col_to_index(body_start, 0)
                                       - delta)
                             if offset < len(_TRUNCATION_MARKER):
                                 row, anchor = 0, 0
                             else:
                                 document = self.owner.transcript.buffer.document
-                                index = document.translate_row_col_to_index(new_start + 1, 0) + offset
+                                new_body = next(body for item, _, _, body in self.owner._entry_starts if item is entry)
+                                index = document.translate_row_col_to_index(new_body, 0) + offset
                                 row, anchor = document.translate_index_to_position(index)
                         else:
                             row += new_start - start
@@ -269,6 +269,7 @@ class DavidTUI:
         self._approval_epoch = 0
         self._shown_approval_epoch = None
         self._entries = []
+        self._status_entry = {'role': 'system', 'text': ''}
         self._entry_starts = []
         self._line_prefixes = []
         self._trimmed = False
@@ -289,7 +290,7 @@ class DavidTUI:
         self._cancel_requested = False
         self.session_id = controller.session_id
         self.saving = controller.saving
-        self.transcript = TextArea(read_only=True, scrollbar=True, wrap_lines=True)
+        self.transcript = TextArea(read_only=True, wrap_lines=True)
         self.transcript.window = TranscriptWindow(
             self, content=self.transcript.control, wrap_lines=True,
             right_margins=self.transcript.window.right_margins,
@@ -297,7 +298,8 @@ class DavidTUI:
         self.completer = WorkspaceCompleter(controller)
         self.composer = TextArea(multiline=True, wrap_lines=True,
                                  completer=self.completer, complete_while_typing=False,
-                                 height=Dimension(min=1, preferred=height, max=height))
+                                 height=Dimension(min=1, max=height), dont_extend_height=True,
+                                 get_line_prefix=lambda line, wrap: [('class:hint', '❯ ' if line == 0 and wrap == 0 else '  ')])
         bindings = KeyBindings()
         editing = has_focus(self.composer)
         self.composer.buffer.on_text_changed += self._sanitize_composer
@@ -379,7 +381,7 @@ class DavidTUI:
             self._decide(False)
 
         normal = HSplit([
-                Window(FormattedTextControl(self.header_text), height=1, style='class:header'),
+                Window(FormattedTextControl(self.banner_text), height=3),
                 self.transcript,
                 ConditionalContainer(
                     Frame(self.approval_panel, title='Approval · yes / no · Ctrl+Y / Ctrl+N',
@@ -388,11 +390,14 @@ class DavidTUI:
                 ConditionalContainer(
                     Window(FormattedTextControl(self.changes_text), height=1, style='class:changes'),
                     Condition(lambda: bool(self.changes))),
-                Frame(self.composer, title='Message · YOU / 나 · Enter send'),
-                Window(FormattedTextControl(self.status_text), height=1, style='class:status'),
-                Window(FormattedTextControl(
-                    '  Alt+Enter newline · PgUp history · Ctrl+C stop · Ctrl+Q quit · /help'),
-                    height=1, style='class:hint'),
+                ConditionalContainer(
+                    Window(FormattedTextControl(self.activity_text), wrap_lines=True,
+                           height=Dimension(min=1, max=3), dont_extend_height=True),
+                    Condition(lambda: self.status != 'idle' or bool(self.detail))),
+                Window(height=1, char='─', style='class:frame.border'),
+                self.composer,
+                Window(height=1, char='─', style='class:frame.border'),
+                Window(FormattedTextControl(self.footer_text), height=1, style='class:hint'),
             ])
         compact = HSplit([
             ConditionalContainer(Window(FormattedTextControl(self.header_text), height=1,
@@ -402,8 +407,11 @@ class DavidTUI:
                                  Condition(lambda: self._size().rows >= 4 and self.approval is None)),
             ConditionalContainer(self.approval_panel, Condition(lambda: self.approval is not None
                                                                 and self._size().rows >= 3)),
+            ConditionalContainer(Window(FormattedTextControl(self.activity_text), height=1),
+                                 Condition(lambda: self._size().rows >= 6 and
+                                           (self.status != 'idle' or bool(self.detail)))),
             self.composer,
-            ConditionalContainer(Window(FormattedTextControl(self.status_text), height=1),
+            ConditionalContainer(Window(FormattedTextControl(self.footer_text), height=1),
                                  Condition(lambda: self._size().rows >= 2)),
         ])
         root = FloatContainer(
@@ -418,8 +426,8 @@ class DavidTUI:
         )
         controller.on_event = self.handle_event
         self.handle_event({'type': 'message', 'role': 'system', 'text':
-            '코드·프롬프트·도구 출력은 설정된 서버로 전송됩니다. 명령 실행은 OS 샌드박스가 아닙니다.\n'
-            '대화 저장은 기본 OFF입니다. /save on은 코드·undo 원본을 평문 저장합니다. /help로 명령을 확인하세요.'})
+            '코드·프롬프트·도구 출력 → 설정된 서버로 전송. 명령 실행은 OS 샌드박스가 아닙니다.\n'
+            '저장 OFF (기본). /save on: 대화·코드·undo 원본을 평문 저장.'})
 
     def _size(self):
         if not hasattr(self, 'application'):
@@ -428,13 +436,34 @@ class DavidTUI:
             return Size(rows=24, columns=80)
         return self.application.output.get_size()
 
-    def header_text(self):
+    def _identity_components(self):
         # Show identity, not a potentially screen-wide absolute Windows path.
         workspace = str(self.controller.workspace).replace('\\', '/').rstrip('/').rsplit('/', 1)[-1]
-        workspace = ' '.join(safe_text(workspace).split())
+        workspace = ' '.join(safe_text(workspace).split()) or '/'
         model = ' '.join(safe_text(self.controller.model_name).split())
-        session = ' '.join(safe_text(self.session_id).split())
-        return f'  DAVID  /  {workspace}  ·  {model}  ·  {session}'
+        return model, workspace
+
+    def header_text(self):
+        model, workspace = self._identity_components()
+        return f'  David  ·  {model}  ·  {workspace}'
+
+    def banner_text(self):
+        model, workspace = self._identity_components()
+        return [('class:title', '  David\n'),
+                ('class:hint', f'  {model} · {workspace}\n')]
+
+    def activity_text(self):
+        # Only real controller state, never invented thinking time/token counts.
+        active = self.status not in ('idle', 'done', 'cancelled', 'error', 'approval')
+        prefix = '✳ ' if active else '  '
+        return [('class:working' if active else 'class:hint', prefix + self.status),
+                ('class:hint', safe_text(' · ' + self.detail) if self.detail else '')]
+
+    def footer_text(self):
+        storage = 'saving ON (평문)' if self.saving else '저장 OFF'
+        if not self.follow_output:
+            return '  Paused · ' + ('new output · ' if self.unseen_output else '') + 'Ctrl+End latest · ' + storage
+        return '  /help · Ctrl+C stop · ' + storage
 
     def changes_text(self):
         if not self.changes:
@@ -651,7 +680,8 @@ class DavidTUI:
 
     def _transcript_prefix(self, line, wrap_count):
         if line < len(self._line_prefixes):
-            return [self._line_prefixes[line]]
+            style, text = self._line_prefixes[line]
+            return [(style, ' ' * len(text) if wrap_count else text)]
         return [('', '  ')]
 
     def _render_transcript(self):
@@ -681,20 +711,28 @@ class DavidTUI:
         if self._trimmed:
             add('[화면 기록 한도로 오래된 출력 생략 · 저장 세션과 모델 컨텍스트 한도는 별도]',
                 'class:body.system')
-        for entry in self._entries:
+        entries = self._entries
+        if self.show_tool_details and self.detail:
+            detail = safe_text(f'Status: {self.status}\n{self.detail}')
+            budget = max(0, min(99980, 200000 - size - 100))
+            if len(detail) > budget:
+                detail = '[상태 상세: 화면 기록 한도로 뒷부분 생략]\n' + detail[:budget]
+            self._status_entry['text'] = detail
+            entries = [*entries, self._status_entry]
+        for entry in entries:
             if lines:
                 add('')
-            entry_starts.append((entry, len(lines), entry.get('_text_offset', 0)))
+            start = len(lines)
             role = entry['role']
             category = role if role in ('user', 'assistant') else 'tool' if role.startswith('tool ') else 'system'
-            label = {'user': 'YOU / 나', 'assistant': 'DAVID', 'system': 'NOTICE / 안내',
-                     'summary': 'TURN / 요약'}.get(role, 'TOOL · ' + role[5:] if category == 'tool' else role.upper())
-            add(label, 'class:role.' + category)
+            if category == 'tool':
+                add(role[5:], 'class:role.tool', ('class:role.tool', '● '))
+            entry_starts.append((entry, start, entry.get('_text_offset', 0), len(lines)))
             text = entry['text']
             if 'details' in entry:
                 text += ('\n' + entry['details']) if self.show_tool_details else ' [Ctrl+O details]'
             in_code = False
-            for body_line in text.split('\n'):
+            for number, body_line in enumerate(text.split('\n')):
                 style = 'class:body.' + category
                 if category == 'assistant':
                     if body_line.lstrip().startswith(('```', '~~~')):
@@ -704,7 +742,9 @@ class DavidTUI:
                         style = 'class:code'
                     elif body_line.startswith(('# ', '## ', '### ', '#### ')):
                         style = 'class:heading'
-                add(body_line, style, ('class:rail.' + category, '  │ '))
+                prefix = ('  ⎿ ' if number == 0 else '    ') if category == 'tool' else (
+                    {'user': '❯ ', 'assistant': '● '}.get(category, '  ') if number == 0 else '  ')
+                add(body_line, style, ('class:role.' + category, prefix))
         text = '\n'.join(lines)
         self._line_prefixes = prefixes
         self._entry_starts = entry_starts

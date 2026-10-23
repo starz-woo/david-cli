@@ -266,16 +266,18 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
             self.controller.ui = {'theme': theme, 'input_height': 6}
             ui = DavidTUI(self.controller, input=self.pipe, output=DummyOutput())
             self.assertEqual(ui.theme, theme)
-            self.assertEqual(ui.composer.window.height.preferred, 6)
+            self.assertEqual(ui.composer.window.height.max, 6)
+            self.assertFalse(ui.composer.window.height.preferred_specified)
             rules = dict(ui.application.style.style_rules)
             if theme == 'mono':
                 self.assertFalse(any('#' in value for value in rules.values()))
             elif theme == 'light':
-                self.assertIn('bg:#edf2f7', rules['header'])
+                self.assertIn('bg:', rules['body.user'])
+                self.assertNotIn('bg:', rules['header'])
         self.controller.ui = {'theme': 'invalid', 'input_height': 'invalid'}
         ui = DavidTUI(self.controller, input=self.pipe, output=DummyOutput())
         self.assertEqual(ui.theme, 'dark')
-        self.assertEqual(ui.composer.window.height.preferred, 5)
+        self.assertEqual(ui.composer.window.height.max, 5)
 
     async def test_slow_submit_does_not_block_composer_or_overwrite_new_draft(self):
         import threading
@@ -425,7 +427,8 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('<b>hello</b>', self.ui.transcript.text)
         self.assertIn('reading', self.ui.status_text())
         self.assertIn('src/app.py', self.ui.status_text())
-        self.assertIn('new-session', self.ui.header_text())
+        self.assertEqual(self.ui.session_id, 'new-session')
+        self.assertNotIn('new-session', self.ui.header_text())
         self.assertIn('saving', self.ui.status_text())
         self.controller.on_event({'type': 'input', 'text': 'edit 한글\u202e'})
         await self.wait_for(lambda: self.ui.composer.text == 'edit 한글\\u202e')
